@@ -16,6 +16,10 @@ READELF=${CROSS}readelf
 NM=${CROSS}nm
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
 case $BOARD in
+equuleus)
+    DTB=${DTB:-../../device-dumps/equuleus/equuleus-live.dtb}
+    CFLAGS="$CFLAGS -DBOARD_EQUULEUS"
+    ;;
 sweet)		DTB=${DTB:-../dtb/boot_unpacked/dtb} ;;
 beryllium)	DTB=${DTB:-../dtb/beryllium/dtb}; CFLAGS="$CFLAGS -DBOARD_BERYLLIUM" ;;
 *)		echo "error: unknown BOARD=$BOARD" >&2; exit 1 ;;
@@ -42,7 +46,7 @@ if [ -n "${1:-}" ]; then
 else
 	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
-if [ "$BOARD" = beryllium ]; then
+if [ "$BOARD" = beryllium ] || [ "$BOARD" = equuleus ]; then
 	# Same layout as the ROM's boot.img: header v1, Image.gz with the DTB
 	# appended (ABL gunzips the kernel and finds the DTB behind the stream).
 	gzip -9 -n -c out/Image | cat - "$DTB" > out/Image.gz-dtb

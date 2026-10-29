@@ -4,7 +4,13 @@
  * (xiaomi beryllium, SDM845); the default is sweet (SM7150).
  * Every value comes from the board's mainline/downstream device tree.
  */
-#if defined(BOARD_BERYLLIUM)
+#if defined(BOARD_EQUULEUS)
+#define BOARD_NAME "equuleus"
+#define FB_BASE 0x9d400000UL
+#define FB_W 1080
+#define FB_H 2248
+#define IMEM_RESTART_REASON 0x146bf65cUL
+#elif defined(BOARD_BERYLLIUM)
 #define BOARD_NAME		"beryllium"
 /* reserved-memory cont_splash_mem@9d400000, simple-framebuffer 1080x2246 */
 #define FB_BASE			0x9d400000UL

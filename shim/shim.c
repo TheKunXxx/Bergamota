@@ -371,6 +371,21 @@ static uint32_t to_us(uint64_t ticks)
 
 void shim_main(uint64_t dtb)
 {
+#if defined(BOARD_EQUULEUS)
+    stage = "equuleus splash probe";
+    for (uint64_t tick = 0; ; tick++) {
+        con_clear(0xff202020U);
+        con_set_scale(2);
+        con_str("BOARD", "equuleus display probe");
+        con_str("MODE", "experimental splash layout");
+        con_hex("TICK", tick);
+        con_hex("DTB", dtb);
+        con_hex("FB", FB_BASE);
+        con_hex("STRIDE", FB_STRIDE);
+        __asm__ volatile("dsb sy" ::: "memory");
+        delay_ms(1000);
+    }
+#endif
 	struct mmu_info mi;
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
