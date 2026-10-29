@@ -19,6 +19,9 @@ case $BOARD in
 equuleus)
     DTB=${DTB:-../../device-dumps/equuleus/equuleus-live.dtb}
     CFLAGS="$CFLAGS -DBOARD_EQUULEUS"
+    if [ "${EQUULEUS_XNU_BOOT:-0}" = 1 ]; then
+        CFLAGS="$CFLAGS -DEQUULEUS_XNU_BOOT"
+    fi
     ;;
 sweet)		DTB=${DTB:-../dtb/boot_unpacked/dtb} ;;
 beryllium)	DTB=${DTB:-../dtb/beryllium/dtb}; CFLAGS="$CFLAGS -DBOARD_BERYLLIUM" ;;

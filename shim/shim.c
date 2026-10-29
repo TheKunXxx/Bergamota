@@ -371,7 +371,17 @@ static uint32_t to_us(uint64_t ticks)
 
 void shim_main(uint64_t dtb)
 {
-#if defined(BOARD_EQUULEUS)
+#if defined(BOARD_EQUULEUS) && defined(EQUULEUS_XNU_BOOT)
+    stage = "equuleus xnu loader";
+    con_clear(BG_BOOT);
+    con_set_scale(2);
+    con_str("BOARD", "equuleus XNU first boot");
+    const char *error = loader_boot(dtb);
+    con_str("STOP", error);
+    for (;;) {
+        __asm__ volatile("wfe");
+    }
+#elif defined(BOARD_EQUULEUS)
     stage = "equuleus splash probe";
     for (uint64_t tick = 0; ; tick++) {
         con_clear(0xff202020U);
