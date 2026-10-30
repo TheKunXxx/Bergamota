@@ -1,0 +1,106 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -80,7 +80,14 @@
+ 	"SE14", 0x00a98000u, 0x18738u, (0x0fu << 18) | (1u << 28), 0x18734u,
+ 	33, 34, 2, 31, 32, 1080, 2246, false,
+ };
++/* Mi 8 Pro: ST FTM5 at 0x49, same SE14 pins, different event protocol. */
++static const struct touch_board touch_equuleus = {
++	"equuleus SE14", 0x00a98000u, 0x18738u, (0x0fu << 18) | (1u << 28), 0x18734u,
++	33, 34, 2, 31, 32, 1080, 2248, false,
++};
+ static const struct touch_board *tb = &touch_sweet;
++static bool touch_equuleus_probe;
++
+ /* GT9896 is Yellowstone in Xiaomi sweet-r-oss, not the Berlin protocol. */
+ #define GOODIX_PID_REG   0x4022u
+ #define GOODIX_EVENT_REG 0x4180u
+@@ -494,6 +501,56 @@
+ 	return err;
+ }
+ 
++/*
++ * Read-only equuleus bring-up. Reference: LineageOS SDM845 kernel
++ * aa8adfe9bf212c6e93238a86980b4024da4f819a, fts_521/fts_lib/
++ * ftsHardware.h and ftsFlash.c: I2C 0x49, HW_REG_R 0xfa, four-byte
++ * big-endian address, no dummy byte on I2C, FTM5 chip ID 0x36/0x39.
++ * No reset, scan-mode, interrupt-enable, calibration or flash commands.
++ * Bit-bang only: no dependency on the ABL's GENI firmware or GPI DMA.
++ */
++static void
++touch_stm_probe_only(void)
++{
++	const uint8_t cmd[5] = {0xfa, 0x20, 0x00, 0x00, 0x00};
++	uint8_t data[8] = {0};
++	uint32_t sda_cfg = touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->sda));
++	uint32_t scl_cfg = touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->scl));
++	uint32_t sda_io = touch_rd(st.gpio, TOUCH_GPIO_IO(tb->sda));
++	uint32_t scl_io = touch_rd(st.gpio, TOUCH_GPIO_IO(tb->scl));
++	printf("EQUULEUS STM: probe-only rst=%#x/%#x irq=%#x/%#x SDA=%#x/%#x SCL=%#x/%#x\n",
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->rst)), touch_rd(st.gpio, TOUCH_GPIO_IO(tb->rst)),
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->irq)), touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)),
++	    sda_cfg, sda_io, scl_cfg, scl_io);
++	/* Release both open-drain lines. Leave reset, IRQ and power untouched. */
++	touch_gpio(tb->sda, 0, 0, 0, false, false);
++	touch_gpio(tb->scl, 0, 0, 0, false, false);
++	touch_wait(2);
++	bool idle = bb_get(tb->sda) && bb_get(tb->scl);
++	if (!idle) {
++		printf("EQUULEUS STM: bus not idle SDA=%u SCL=%u; read skipped\n",
++		    (unsigned)bb_get(tb->sda), (unsigned)bb_get(tb->scl));
++	} else {
++		st.probing = true;
++		int err = bb_xfer(0x49, cmd, sizeof(cmd), data, sizeof(data));
++		st.probing = false;
++		printf("EQUULEUS STM: FA 20000000 err=%d raw=%02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    err, data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
++		if (!err && data[0] == 0x36 && data[1] == 0x39) {
++			printf("EQUULEUS STM: FTM5 ID matched; FW raw=%02x:%02x; no HID events in probe mode\n",
++			    data[4], data[5]);
++		} else {
++			printf("EQUULEUS STM: no confirmed FTM5 identity; stopping without reset or writes\n");
++		}
++	}
++	/* Restore the bootloader's GPIO configuration and output latches. */
++	touch_wr(st.gpio, TOUCH_GPIO_IO(tb->sda), sda_io & 2u);
++	touch_wr(st.gpio, TOUCH_GPIO_IO(tb->scl), scl_io & 2u);
++	touch_wr(st.gpio, TOUCH_GPIO_CFG(tb->sda), sda_cfg);
++	touch_wr(st.gpio, TOUCH_GPIO_CFG(tb->scl), scl_cfg);
++	printf("EQUULEUS STM: probe complete; pin configuration restored\n");
++}
++
+ static int
+ touch_read(uint8_t addr, uint16_t reg, bool wide, uint8_t *buf, unsigned len)
+ {
+@@ -1053,6 +1110,15 @@
+ 	printf("SWEET TOUCH: starting in %u s\n", delay_s);
+ 	touch_wait(delay_s * 1000u);
+ 	printf("SWEET TOUCH: mapping GCC/TLMM/%s\n", tb->name);
++	if (touch_equuleus_probe) {
++		st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
++		if (st.gpio) {
++			touch_stm_probe_only();
++		} else {
++			printf("EQUULEUS STM: TLMM mapping failed\n");
++		}
++		goto out;
++	}
+ 	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+ 	st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
+ 	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
+@@ -1220,6 +1286,15 @@
+ 	if (bb_half_us < 2 || bb_half_us > 10) {
+ 		bb_half_us = 5;
+ 	}
++	/* Equuleus must never enter the Poco/Focaltech/Novatek probing path. */
++	if (sweet_board_is("xiaomi,equuleus") && enabled) {
++		if (enabled != 2) {
++			printf("EQUULEUS STM: only sweettouch=2 (read-only probe) is implemented\n");
++			return;
++		}
++		tb = &touch_equuleus;
++		touch_equuleus_probe = true;
++	}
+ 	if (!enabled) {
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+ 		return;
