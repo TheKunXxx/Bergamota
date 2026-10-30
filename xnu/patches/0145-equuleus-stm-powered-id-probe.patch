@@ -1,0 +1,123 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -87,6 +87,7 @@
+ };
+ static const struct touch_board *tb = &touch_sweet;
+ static bool touch_equuleus_probe;
++static bool touch_equuleus_power_probe;
+ 
+ /* GT9896 is Yellowstone in Xiaomi sweet-r-oss, not the Berlin protocol. */
+ #define GOODIX_PID_REG   0x4022u
+@@ -502,6 +503,59 @@
+ }
+ 
+ /*
++ * Equuleus powered identification test (sweettouch=3). Live DT + Android:
++ * AVDD = PM8998 L28, 3300 mV (cmd-db ldoa28); VDDIO = active-high GPIO23.
++ * pinctrl-sdm845.c puts GPIO23 in SOUTH, GPIO31..34 in NORTH.
++ * Only power-on: never disable the shared VDDIO supply (also feeds NDT).
++ * No controller firmware, flash, calibration, scan-mode or FIFO writes.
++ */
++static bool
++touch_stm_power_on(void)
++{
++	/* TLMM 0x03400000 + SOUTH 0x00900000 + GPIO23 * 0x1000. */
++	vm_offset_t vddio = ml_io_map(0x03d17000u, 0x1000u);
++	if (!vddio) {
++		printf("EQUULEUS STM: VDDIO GPIO23 mapping failed\n");
++		return false;
++	}
++	uint32_t cfg = touch_rd(vddio, 0), io = touch_rd(vddio, 4);
++	uint32_t rst = touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->rst));
++	printf("EQUULEUS STM: power-before GPIO23(SOUTH)=%#x/%#x RESET32(NORTH)=%#x/%#x\n",
++	    cfg, io, rst, touch_rd(st.gpio, TOUCH_GPIO_IO(tb->rst)));
++	if (cfg == 0xffffffffu || io == 0xffffffffu || rst == 0xffffffffu) {
++		printf("EQUULEUS STM: invalid GPIO readback; power sequence skipped\n");
++		return false;
++	}
++	/* Match Android's active reset/IRQ pulls and 16 mA drive. */
++	touch_gpio(tb->irq, 0, 3, 7, false, false);
++	touch_gpio(tb->rst, 0, 3, 7, true, false);
++	int err = sweet_rpmh_vreg_enable("ldoa28", 3300);
++	printf("EQUULEUS STM: AVDD ldoa28 3300mV vote err=%d\n", err);
++	if (err) {
++		return false; /* RPMh quarantines uncertain transactions: no retry. */
++	}
++	/* GPIO23 is SOUTH: do not call touch_gpio(), which addresses NORTH. */
++	touch_wr(vddio, 4, (io & 2u) | 2u); /* latch high before enabling output */
++	touch_wr(vddio, 0, (cfg & ~0x3ffu) | 0x203u); /* GPIO, pull-up, 2 mA, output */
++	if (!(touch_rd(vddio, 4) & 2u) ||
++	    (touch_rd(vddio, 0) & 0x3ffu) != 0x203u) {
++		printf("EQUULEUS STM: VDDIO GPIO23 latch/config mismatch; stopping\n");
++		return false;
++	}
++	touch_wait(10); /* DT VDDIO startup-delay-us=4000; reset low >=10 ms */
++	touch_gpio(tb->sda, 0, 3, 0, false, false);
++	touch_gpio(tb->scl, 0, 3, 0, false, false);
++	touch_gpio(tb->rst, 0, 3, 7, true, true);
++	touch_wait(100);
++	printf("EQUULEUS STM: power-after GPIO23=%#x/%#x RESET32=%#x/%#x IRQ31=%#x/%#x SDA=%u SCL=%u\n",
++	    touch_rd(vddio, 0), touch_rd(vddio, 4),
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->rst)), touch_rd(st.gpio, TOUCH_GPIO_IO(tb->rst)),
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->irq)), touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)),
++	    (unsigned)bb_get(tb->sda), (unsigned)bb_get(tb->scl));
++	return true;
++}
++
++/*
+  * Read-only equuleus bring-up. Reference: LineageOS SDM845 kernel
+  * aa8adfe9bf212c6e93238a86980b4024da4f819a, fts_521/fts_lib/
+  * ftsHardware.h and ftsFlash.c: I2C 0x49, HW_REG_R 0xfa, four-byte
+@@ -1113,6 +1167,9 @@
+ 	if (touch_equuleus_probe) {
+ 		st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
+ 		if (st.gpio) {
++			if (touch_equuleus_power_probe && !touch_stm_power_on()) {
++				goto out;
++			}
+ 			touch_stm_probe_only();
+ 		} else {
+ 			printf("EQUULEUS STM: TLMM mapping failed\n");
+@@ -1288,12 +1345,13 @@
+ 	}
+ 	/* Equuleus must never enter the Poco/Focaltech/Novatek probing path. */
+ 	if (sweet_board_is("xiaomi,equuleus") && enabled) {
+-		if (enabled != 2) {
+-			printf("EQUULEUS STM: only sweettouch=2 (read-only probe) is implemented\n");
++		if (enabled != 2 && enabled != 3) {
++			printf("EQUULEUS STM: use sweettouch=2 (passive ID) or 3 (power-on ID); no HID yet\n");
+ 			return;
+ 		}
+ 		tb = &touch_equuleus;
+ 		touch_equuleus_probe = true;
++		touch_equuleus_power_probe = enabled == 3;
+ 	}
+ 	if (!enabled) {
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -113,7 +113,7 @@
+ static int
+ rh_map(void)
+ {
+-	rh_be = sweet_board_beryllium();
++	rh_be = sweet_board_beryllium() || sweet_board_is("xiaomi,equuleus");
+ 	if (!rh_rsc) {
+ 		rh_rsc = ml_io_map(rh_be ? RH_BE_RSC_PA : RH_RSC_PA, 0x100);
+ 	}
+@@ -416,9 +416,12 @@
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+-	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
++	/* Keep the existing sweet rail policy; add only equuleus L28 at 3.3 V. */
++	bool sweet_rail = res && !strcmp(res, "ldoc11") && mv >= 2950 && mv <= 3400;
++	bool equuleus_rail = res && sweet_board_is("xiaomi,equuleus") &&
++	    !strcmp(res, "ldoa28") && mv == 3300;
++	if (!sweet_rail && !equuleus_rail) {
++		printf("SWEET RPMH: unsupported touch rail/voltage for this board\n");
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
