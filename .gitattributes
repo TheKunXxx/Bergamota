@@ -2,3 +2,4 @@ xnu/patches/0142-equuleus-stm-fts-readonly-probe.patch -whitespace
 xnu/patches/0143-xnu8796-new-iig-kernel-content.patch -whitespace
 xnu/patches/0145-equuleus-stm-powered-id-probe.patch -whitespace
 xnu/patches/0146-equuleus-stm-fifo-probe.patch -whitespace
+xnu/patches/0147-equuleus-stm-hid-touch.patch -whitespace

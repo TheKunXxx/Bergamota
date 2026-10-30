@@ -1,0 +1,140 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -89,6 +89,7 @@
+ static bool touch_equuleus_probe;
+ static bool touch_equuleus_power_probe;
+ static bool touch_equuleus_fifo_probe;
++static bool touch_equuleus_hid;
+ 
+ /* GT9896 is Yellowstone in Xiaomi sweet-r-oss, not the Berlin protocol. */
+ #define GOODIX_PID_REG   0x4022u
+@@ -557,12 +558,50 @@
+ }
+ 
+ 
++static void touch_report(uint32_t mask, const int *x, const int *y);
++
++/* ST FIFO is a stream of per-slot deltas, NOT a complete touch frame.
++ * Preserve every other slot when one finger moves or leaves. The HID service
++ * already maps physical pixels to the sweetfb_scale canvas; do not scale here.
++ */
++static void
++touch_stm_hid_event(const uint8_t *data)
++{
++	if (data[0] != 0x13 && data[0] != 0x23 && data[0] != 0x33) {
++		return;
++	}
++	unsigned id = data[1] >> 4, type = data[1] & 15u;
++	if (id >= TOUCH_MAX) {
++		return;
++	}
++	uint32_t bit = 1u << id, mask = st.active;
++	int x[TOUCH_MAX], y[TOUCH_MAX];
++	memcpy(x, st.x, sizeof(x));
++	memcpy(y, st.y, sizeof(y));
++	unsigned px = data[2] | ((data[3] & 15u) << 8);
++	unsigned py = (data[4] << 4) | (data[3] >> 4);
++	/* Leave records need only a valid slot; coordinates/type may be absent.
++	 * Finger/glove only: palm, hover, stylus and malformed points release
++	 * this slot rather than synthesizing a tap or leaving it stuck down.
++	 */
++	if (data[0] == 0x33 || (type != 1 && type != 2) ||
++	    px >= tb->w || py >= tb->h) {
++		mask &= ~bit;
++	} else {
++		x[id] = (int)px;
++		y[id] = (int)py;
++		mask |= bit;
++	}
++	touch_report(mask, x, y);
++}
++
+ /* ST fts_521: A0/00/01 active multitouch, 86 reads one 8-byte FIFO event.
+- * Mode4 is diagnostic only: no firmware/calibration writes and no HID.
++ * Mode4 is bounded diagnostic; mode5 continuously dispatches HID.
++ * Neither mode uploads firmware or writes calibration/flash.
+  * Poll instead of routing a TLMM interrupt into XNU during bring-up.
+  */
+ static void
+-touch_stm_fifo_probe(void)
++touch_stm_fifo_probe(bool hid)
+ {
+ 	const uint8_t id_cmd[5] = {0xfa, 0x20, 0, 0, 0};
+ 	const uint8_t fifo_cmd = 0x86;
+@@ -600,13 +639,14 @@
+ 		}
+ 	}
+ 	err = bb_xfer(0x49, scan_on, sizeof(scan_on), NULL, 0);
+-	printf("EQUULEUS STM FIFO: scan A0 00 01 err=%d; no HID\n", err);
++	printf("EQUULEUS STM FIFO: scan A0 00 01 err=%d HID=%u\n", err, (unsigned)hid);
+ 	if (err) {
+ 		return;
+ 	}
+ 	touch_wait(20);
+-	printf("EQUULEUS STM FIFO: READY -- touch/swipe now; 12000 polls, 10ms pauses\n");
+-	for (unsigned poll = 0; poll < 12000; ++poll) {
++	printf("EQUULEUS STM FIFO: READY HID=%u (%s)\n", (unsigned)hid,
++	    hid ? "continuous, 5ms pauses" : "12000 polls, 10ms pauses");
++	for (unsigned poll = 0; hid || poll < 12000; ++poll) {
+ 		/* Bound each batch even if the controller never reports an empty FIFO. */
+ 		for (unsigned n = 0; n < 32; ++n) {
+ 			err = bb_xfer(0x49, &fifo_cmd, 1, data, sizeof(data));
+@@ -627,12 +667,15 @@
+ 				++points;
+ 				if (!valid) ++invalid;
+ 			}
+-			if (printed < 256 || data[0] == 0xf3) {
++			if (printed < (hid ? 16u : 256u) || data[0] == 0xf3) {
+ 				printf("EQUULEUS STM FIFO: event=%02x id=%u type=%u x=%u y=%u point=%u valid=%u raw=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+ 				    data[0], id, type, x, y, (unsigned)point, (unsigned)valid,
+ 				    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
+ 				++printed;
+ 			}
++			if (hid) {
++				touch_stm_hid_event(data);
++			}
+ 			if (data[0] == 0xf3 || data[0] == 0x03) {
+ 				printf("EQUULEUS STM FIFO: controller error/reset; stopping\n");
+ 				goto stop;
+@@ -642,9 +685,12 @@
+ 			printf("EQUULEUS STM FIFO: poll=%u events=%u points=%u invalid=%u IRQ=%u\n",
+ 			    poll, events, points, invalid, (unsigned)bb_get(tb->irq));
+ 		}
+-		touch_wait(10);
++		touch_wait(hid ? 5 : 10);
+ 	}
+ stop:
++	if (hid) {
++		touch_report(0, st.x, st.y); /* release all slots on bus/controller failure */
++	}
+ 	err = bb_xfer(0x49, scan_off, sizeof(scan_off), NULL, 0);
+ 	printf("EQUULEUS STM FIFO: DONE events=%u points=%u invalid=%u scan-off err=%d; power kept on\n",
+ 	    events, points, invalid, err);
+@@ -1266,7 +1312,7 @@
+ 				goto out;
+ 			}
+ 			if (touch_equuleus_fifo_probe) {
+-				touch_stm_fifo_probe();
++				touch_stm_fifo_probe(touch_equuleus_hid);
+ 			} else {
+ 				touch_stm_probe_only();
+ 			}
+@@ -1444,14 +1490,15 @@
+ 	}
+ 	/* Equuleus must never enter the Poco/Focaltech/Novatek probing path. */
+ 	if (sweet_board_is("xiaomi,equuleus") && enabled) {
+-		if (enabled != 2 && enabled != 3 && enabled != 4) {
+-			printf("EQUULEUS STM: use sweettouch=2 (passive ID) 3 (power-on ID), or 4 (FIFO test); no HID yet\n");
++		if (enabled != 2 && enabled != 3 && enabled != 4 && enabled != 5) {
++			printf("EQUULEUS STM: use sweettouch=2 (passive ID), 3 (power-on ID), 4 (FIFO test), or 5 (ST HID)\n");
+ 			return;
+ 		}
+ 		tb = &touch_equuleus;
+ 		touch_equuleus_probe = true;
+ 		touch_equuleus_power_probe = enabled >= 3;
+-		touch_equuleus_fifo_probe = enabled == 4;
++		touch_equuleus_fifo_probe = enabled >= 4;
++		touch_equuleus_hid = enabled == 5;
+ 	}
+ 	if (!enabled) {
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
