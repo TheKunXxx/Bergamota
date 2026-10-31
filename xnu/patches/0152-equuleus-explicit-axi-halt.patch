@@ -1,0 +1,63 @@
+--- a/bsd/dev/equuleus_mss.c
++++ b/bsd/dev/equuleus_mss.c
+@@ -1035,13 +1035,25 @@
+ 	/* tcsr: cached permanent ml_io_map mapping; never unmap. */
+ }
+ 
++/* 0152: explicit mode 7 follows downstream PIL's request on every AXI port.
++ * IDLE alone need not imply that the port has accepted an isolation request.
++ * Keep mode 6 unchanged for comparison; no failed request permits reclaim.
++ */
++static bool mss_halt_all;
++
++bool
++equuleus_mss_halt_all(void)
++{
++	return mss_halt_all;
++}
++
+ /* Linux samples IDLE before clearing HALTREQ. A late post-clear change is not proof of halt. */
+ static bool
+ halt_port(const char *name, vm_offset_t port)
+ {
+ 	uint32_t ack = 0, waited = 0, request, idle;
+ 
+-	if (rd(port + 8)) {
++	if (!equuleus_mss_halt_all() && rd(port + 8)) {
+ 		say("eqmss: mss: halt port %s is idle already\n", name);
+ 		return true;
+ 	}
+@@ -1059,7 +1071,7 @@
+ 	say("eqmss: mss: halt port %s: released req %#x ack %#x idle %#x\n",
+ 	    name, rd(port), rd(port + 4), rd(port + 8));
+ 	/* Like Linux, IDLE is authoritative; reject an unlatched request on this explicit request path. */
+-	return request == 1 && idle != 0;
++	return request == 1 && idle != 0 && (!equuleus_mss_halt_all() || ack != 0);
+ }
+ 
+ /* 0150 MPSS and SMP2P, adapted from the pinned dipper source; APSL-2.0. */
+@@ -2173,17 +2185,19 @@
+         !PE_parse_boot_argn("sweetmss", &mode, sizeof(mode)) || mode == 0) {
+         return;
+     }
+-    if (mode != 1 && mode != 2 && mode != 5 && mode != 6) {
+-        say("eqmss: supported sweetmss modes: 1 survey, 2 rails/clocks, 5 MBA only, 6 MPSS/SMP2P\n");
++    if (mode != 1 && mode != 2 && mode != 5 && mode != 6 && mode != 7) {
++        say("eqmss: supported sweetmss modes: 1 survey, 2 rails/clocks, 5 MBA only, 6 MPSS/SMP2P, 7 MPSS with explicit HALT on all ports\n");
+         return;
+     }
+     entered = true;
+-    say("eqmss: port 0151, mode %u; no Wi-Fi driver or GLINK host services\n", mode);
++    say("eqmss: port 0152, mode %u; no Wi-Fi driver or GLINK host services\n", mode);
+     mss_w2a();
+     if (mode == 2) {
+         mss_w2bc(2);
+-    } else if (mode == 5 || mode == 6) {
+-        mss_full_test = mode == 6;
++    } else if (mode == 5 || mode == 6 || mode == 7) {
++        mss_halt_all = mode == 7;
++        mss_full_test = mode == 6 || mode == 7;
++        say("eqmss: explicit AXI HALT on all ports: %u\n", mss_halt_all ? 1u : 0u);
+         mss_run_mba();
+     }
+     say("eqmss: test finished; reboot fully before another hardware test\n");

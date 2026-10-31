@@ -7,3 +7,4 @@ xnu/patches/0148-equuleus-smem-table-stride.patch -whitespace
 xnu/patches/0149-equuleus-mss-mba-bringup.patch -whitespace
 xnu/patches/0150-equuleus-mpss-smp2p-bringup.patch -whitespace
 xnu/patches/0151-equuleus-mpss-stop-diagnostics.patch -whitespace
+xnu/patches/0152-equuleus-explicit-axi-halt.patch -whitespace

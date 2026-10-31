@@ -12,27 +12,28 @@ def prepare(path):
     text = path.read_text()
     marker = '# EQUULEUS_REQUIRED_PATCHES'
     if marker in text:
-        old = '*/0148-*|*/0149-*|*/0150-*)'
-        new = '*/0148-*|*/0149-*|*/0150-*|*/0151-*)'
+        new = '*/0148-*|*/0149-*|*/0150-*|*/0151-*|*/0152-*)'
         if new in text:
             return
-        if text.count(old) != 1:
-            raise SystemExit('Unknown existing required-patch guard')
-        path.write_text(text.replace(old, new))
-        return
+        for old in ('*/0148-*|*/0149-*|*/0150-*|*/0151-*)',
+                    '*/0148-*|*/0149-*|*/0150-*)'):
+            if text.count(old) == 1:
+                path.write_text(text.replace(old, new))
+                return
+        raise SystemExit('Unknown existing required-patch guard')
     needle = '                warning "Skipping patch ${PATCH} (already upstream, previously applied, or malformed): ${APPLY_CHECK}"'
     if text.count(needle) != 1:
         raise SystemExit('Unknown build.sh patch loop; refusing to continue')
     guard = '''                # EQUULEUS_REQUIRED_PATCHES
                 case "$PATCH" in
-                    */0148-*|*/0149-*|*/0150-*|*/0151-*)
+                    */0148-*|*/0149-*|*/0150-*|*/0151-*|*/0152-*)
                         printf '%s\\n' "Required equuleus patch failed: $PATCH" "$APPLY_CHECK" >&2
                         exit 1
                         ;;
                 esac
 '''
     path.write_text(text.replace(needle, guard + needle))
-    print('0148/0149/0150/0151 patch failures are now fatal')
+    print('0148/0149/0150/0151/0152 patch failures are now fatal')
 
 
 def verify(root):
@@ -44,7 +45,7 @@ def verify(root):
         ],
         dev / 'sweet_rpmh.c': ['sweet_rpmh_bus_acquire(void)',
                                 'sweet_rpmh_bus_release(void)'],
-        dev / 'equuleus_mss.c': ['eqmss: port 0151', 'equuleus_mss_stop_snapshot(', 'held idle %#x', 'mss_run_mba(void)', 'equuleus_mpss_load('],
+        dev / 'equuleus_mss.c': ['eqmss: port 0152', 'mss_halt_all = mode == 7;', 'equuleus_mss_stop_snapshot(', 'held idle %#x', 'mss_run_mba(void)', 'equuleus_mpss_load('],
         root / 'xnu/bsd/conf/files': ['bsd/dev/equuleus_mss.c'],
     }
     for path, needles in checks.items():
@@ -57,7 +58,7 @@ def verify(root):
     kernel = root / f'fakeroot/System/Library/Kernels/kernel.{variant}.{machine}'
     symbols = subprocess.run(['nm', str(kernel)], check=True,
                              capture_output=True, text=True).stdout
-    for required in ('_equuleus_mss_probe', '_equuleus_mpss_load', '_equuleus_mss_stop_snapshot'):
+    for required in ('_equuleus_mss_probe', '_equuleus_mpss_load', '_equuleus_mss_stop_snapshot', '_equuleus_mss_halt_all'):
         if not any(line.split()[-1:] == [required] for line in symbols.splitlines()):
             raise SystemExit(f'Missing linked kernel entry point: {required}')
     print('Required source changes and linked MSS entry point verified')
