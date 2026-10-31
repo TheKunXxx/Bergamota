@@ -48,3 +48,24 @@ Interpretation: compare whether modem IDLE is already zero before STOP,
 whether clock status changes across STOP_ACK, whether HALTREQ reads back,
 and whether TCSR state changes after reset. These observations guide the
 next targeted change; GLINK/QRTR host services are still absent.
+
+## First device failure and correction
+
+The first0151 device boot panicked in pmap_remove_options while unmapping
+a4KiB range. Diagnostic RMB/PDC/AOSS windows used0x1000 unmap sizes on
+a16KiB-page kernel. All three map/unmap pairs now use PAGE_SIZE. The
+mock validates page-aligned addresses and sizes. Corrected device test
+is still pending; this was a diagnostic bug, not evidence of AXI behavior.
+
+## Second device failure: permanent MMIO mappings
+
+User c2adbad/run41215677237 passed compilation, device reached MBA4
+and SMP2P READY2. Photo shows before-stop snapshot all7clocks on,
+q6/nc IDLE1, modem IDLE0, reset values0, then vm_map_delete panic:
+Attempting to remove permanent VM map entry. PAGE_SIZE corrected the
+range alignment but ml_io_map mappings are permanent in this kernel.
+Snapshot now caches each of four mappings and never unmaps them.
+No changes to other transient mappings or TrustZone ownership logic.
+Mock now supplies no ml_io_unmap implementation, checks three calls
+reuse mappings, retries only failed maps. 25cases plus7HALT cases pass.
+Corrected full XNU build/device validation pending.

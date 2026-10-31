@@ -21,6 +21,7 @@ with tempfile.TemporaryDirectory() as td:
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
 typedef uintptr_t vm_offset_t;
@@ -71,6 +72,7 @@ int main(void) {
     snap_harness=r'''
 #include <assert.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
 typedef uintptr_t vm_offset_t;
@@ -87,23 +89,28 @@ static unsigned maps,unmaps,rmb_reads,clock_reads,fail_map;
 static void say(const char *s,...) {(void)s;}
 static void gcc_show(void) {clock_reads++;}
 static vm_offset_t ml_io_map(uintptr_t p,unsigned n) {assert(n && n%PAGE_SIZE==0 && p%PAGE_SIZE==0);maps++;return maps==fail_map?0:p;}
-static void ml_io_unmap(vm_offset_t p,unsigned n) {assert(p && n && n%PAGE_SIZE==0 && p%PAGE_SIZE==0);unmaps++;}
 static uint32_t rd(vm_offset_t a) {if(a>=RMB_PHYS && a<RMB_PHYS+4096)rmb_reads++;return 0;}
 '''
     snap_main=r'''
-int main(void) {
+int main(int argc,char **argv) {
+ assert(argc==3);
+ unsigned p=(unsigned)atoi(argv[1]);fail_map=(unsigned)atoi(argv[2]);
+ assert(p<5 && fail_map<=4);
  const char *phases[]={"before-stop","after-stop","before-halt","after-halt","after-reset"};
- for(unsigned p=0;p<5;p++)for(fail_map=0;fail_map<=4;fail_map++) {
-  maps=unmaps=rmb_reads=clock_reads=0;
-  equuleus_mss_stop_snapshot(phases[p]);
-  assert(maps==4 && unmaps==(fail_map?3:4) && clock_reads==1);
-  if(p==4 || fail_map==2 || fail_map==3 || fail_map==4)assert(rmb_reads==0);
-  else assert(rmb_reads==3);
- }
+ equuleus_mss_stop_snapshot(phases[p]);
+ assert(maps==4 && unmaps==0 && clock_reads==1);
+ if(p==4 || fail_map==2 || fail_map==3 || fail_map==4)assert(rmb_reads==0);
+ else assert(rmb_reads==3);
+ equuleus_mss_stop_snapshot(phases[p]);
+ assert(maps==(fail_map?5u:4u) && unmaps==0 && clock_reads==2);
+ equuleus_mss_stop_snapshot(phases[p]);
+ assert(maps==(fail_map?5u:4u) && unmaps==0 && clock_reads==3);
  return 0;
 }
 '''
     c.write_text(snap_harness+snapshot+snap_main)
     subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-fsanitize=undefined',str(c),'-o',str(exe)],check=True)
-    subprocess.run([str(exe)],check=True)
-    print('25 actual snapshot phase/map-failure cases passed; all successful mappings released')
+    for phase in range(5):
+        for failed in range(5):
+            subprocess.run([str(exe),str(phase),str(failed)],check=True)
+    print('25 snapshot cases passed: permanent mappings cached, failed maps retried, zero unmap calls')

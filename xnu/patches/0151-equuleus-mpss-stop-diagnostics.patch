@@ -11,10 +11,10 @@
 +{
 +	static const uint32_t offsets[] = { 0x3000, 0x5000, 0x4000 };
 +	static const char *const names[] = { "q6", "modem", "nc" };
-+	vm_offset_t tcsr = ml_io_map(TCSR_HALT_PHYS, 0x10000);
-+	vm_offset_t rmb = ml_io_map(RMB_PHYS, PAGE_SIZE);
-+	vm_offset_t pdc = ml_io_map(PDC_PHYS, PAGE_SIZE);
-+	vm_offset_t restart = ml_io_map(AOSS_CC_PHYS, PAGE_SIZE);
++	static vm_offset_t tcsr; if (!tcsr) { tcsr = ml_io_map(TCSR_HALT_PHYS, 0x10000); }
++	static vm_offset_t rmb; if (!rmb) { rmb = ml_io_map(RMB_PHYS, PAGE_SIZE); }
++	static vm_offset_t pdc; if (!pdc) { pdc = ml_io_map(PDC_PHYS, PAGE_SIZE); }
++	static vm_offset_t restart; if (!restart) { restart = ml_io_map(AOSS_CC_PHYS, PAGE_SIZE); }
 +
 +	say("eqmss: stop snapshot %s\n", phase);
 +	gcc_show();
@@ -30,10 +30,10 @@
 +		    phase, (int32_t)rd(rmb + RMB_MBA_STATUS), rd(rmb + RMB_MSS_STATUS),
 +		    rd(rmb + RMB_ALT_RESET), rd(pdc + PDC_SYNC_RESET), rd(restart));
 +	}
-+	if (restart) { ml_io_unmap(restart, PAGE_SIZE); }
-+	if (pdc) { ml_io_unmap(pdc, PAGE_SIZE); }
-+	if (rmb) { ml_io_unmap(rmb, PAGE_SIZE); }
-+	if (tcsr) { ml_io_unmap(tcsr, 0x10000); }
++	/* restart: cached permanent ml_io_map mapping; never unmap. */
++	/* pdc: cached permanent ml_io_map mapping; never unmap. */
++	/* rmb: cached permanent ml_io_map mapping; never unmap. */
++	/* tcsr: cached permanent ml_io_map mapping; never unmap. */
 +}
 +
 +/* Linux samples IDLE before clearing HALTREQ. A late post-clear change is not proof of halt. */
