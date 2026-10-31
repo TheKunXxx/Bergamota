@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Replay MSS+GLINK patches; test donor transport and bounded equuleus MMIO adapter."""
+from pathlib import Path
+import subprocess,tempfile,os
+repo=Path(__file__).resolve().parents[2]
+with tempfile.TemporaryDirectory() as td:
+ root=Path(td);p=root/'bsd/dev/equuleus_mss.c';p.parent.mkdir(parents=True)
+ tail=(repo/'xnu/patches/0149-equuleus-mss-mba-bringup.patch').read_text().split('+++ b/bsd/dev/equuleus_mss.c\n',1)[1]
+ p.write_text('\n'.join(l[1:] for l in tail.splitlines() if l.startswith('+'))+'\n')
+ conf=root/'bsd/conf/files';conf.parent.mkdir(parents=True)
+ conf.write_text('bsd/dev/beryllium_wlan.c\t\tstandard\nbsd/dev/equuleus_mss.c\t\tstandard\nbsd/dev/beryllium_bt_hci.c\t\tstandard\n')
+ subprocess.run(['git','init','-q',td],check=True)
+ for prefix in ['0150','0151','0152','0153']:
+  patch=next((repo/'xnu/patches').glob(prefix+'-*'))
+  subprocess.run(['git','apply','--check',str(patch)],cwd=root,check=True)
+  subprocess.run(['git','apply',str(patch)],cwd=root,check=True)
+ source=p.read_text(); dev=p.parent
+ harness=r'''
+#define MI8_GLINK_HOST_TEST
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+static unsigned allocs;
+static void *test_alloc(size_t n) {void *p=calloc(1,n);if(p)allocs++;return p;}
+static void test_free(void *p) {if(p){assert(allocs);allocs--;free(p);}}
+#define MI8_ALLOC(n) test_alloc(n)
+#define MI8_FREE(p,n) test_free(p)
+#include "equuleus_glink.c"
+static uint8_t mem[65536];static uint64_t clock_us;static unsigned rings;
+static bool item(void *c,uint32_t i,uint32_t *o,uint32_t *n) {
+ (void)c;if(i<478 || i>480)return false;
+ *o=i==478?0x1000:i==479?0x2000:0x4000;*n=i==478?32:4096;return true;
+}
+static void load(void *c,uint32_t o,void *v,uint32_t n) {(void)c;assert((uint64_t)o+n<=sizeof(mem));memcpy(v,mem+o,n);}
+static void store(void *c,uint32_t o,uint32_t v) {(void)c;assert(o==0x1004 || o==0x1008 || (o>=0x2000 && o+4<=0x3000));put32(mem+o,v);}
+static void bell(void *c) {(void)c;rings++;}
+static void nap(void *c,uint32_t n) {(void)c;clock_us+=n;}
+static uint64_t now(void *c) {(void)c;return clock_us;}
+static void rx(unsigned cmd,unsigned cid,uint32_t arg,const void *data,unsigned n) {
+ uint32_t head=get32(mem+0x100c);uint8_t b[4096]={0};header(b,cmd,cid,arg);if(n)memcpy(b+8,data,n);
+ unsigned len=(8+n+7)&~7u;assert(len<4096);
+ for(unsigned i=0;i<len;i++)mem[0x4000+(head+i)%4096]=b[i];
+ put32(mem+0x100c,(head+len)%4096);
+}
+static void drain(void) {put32(mem+0x1000,get32(mem+0x1004));}
+static struct mi8_glink *fresh(void) {
+ memset(mem,0,sizeof(mem));struct mi8_glink_cfg c={.name="test",.remote_pid=1,.smem_item=item,.smem_read=load,.smem_write32=store,.ring=bell,.sleep_us=nap,.now_us=now};
+ struct mi8_glink *g=mi8_glink_create(&c);assert(g);return g;
+}
+static void qrtr(struct mi8_glink *g,unsigned type,unsigned service) {
+ uint8_t b[8+52]={0};put32(b,52);put32(b+4,0);
+ uint8_t *q=b+8;put32(q,1);put32(q+4,type);put32(q+8,0);put32(q+12,CTRL);put32(q+20,20);put32(q+24,1);put32(q+28,CTRL);
+ put32(q+32,type);put32(q+36,service);put32(q+40,1|(180u<<8));put32(q+44,0);put32(q+48,23);
+ rx(DATA,7,g->local[0].id,b,sizeof(b));mi8_glink_poll_once(g);drain();
+}
+int main(void) {
+ struct mi8_glink *g=fresh();assert(mi8_glink_start(g)==0);assert(get32(mem+0x1004)==8 && rings);drain();
+ rx(VERSION,1,1,NULL,0);rx(VERSION_ACK,1,1,NULL,0);rx(OPEN,7,7,"IPCRTR",7);mi8_glink_poll_once(g);drain();
+ assert(g->agreed && g->remote==7 && g->asked && !g->broken);
+ rx(OPEN_ACK,1,0,NULL,0);mi8_glink_poll_once(g);drain();assert(g->opened);
+ uint8_t it[8];put32(it,4096);put32(it+4,0);rx(INTENT,7,1,it,8);mi8_glink_poll_once(g);drain();assert(g->foreign[0].there && g->foreign[0].id==0);
+ qrtr(g,Q_HELLO,0);assert(g->hello && !g->broken);
+ qrtr(g,Q_NEW_SERVER,66);struct mi8_qrtr_server s[4];assert(mi8_glink_qrtr_servers(g,s,4)==1 && s[0].service==66 && s[0].instance==180);
+ qrtr(g,Q_DEL_SERVER,66);assert(mi8_glink_qrtr_servers(g,s,4)==0);
+ mi8_glink_destroy(g);
+ g=fresh();assert(mi8_glink_start(g)==0);put32(mem+0x100c,4096);mi8_glink_poll_once(g);assert(g->broken);mi8_glink_destroy(g);
+ g=fresh();assert(mi8_glink_start(g)==0);rx(OPEN,7,0,NULL,0);mi8_glink_poll_once(g);assert(g->broken);mi8_glink_destroy(g);
+ g=fresh();assert(mi8_glink_start(g)==0);rx(255,0,0,NULL,0);mi8_glink_poll_once(g);assert(g->broken);mi8_glink_destroy(g);
+ g=fresh();assert(mi8_glink_start(g)==0);put32(mem+0x1008,4088);put32(mem+0x100c,4088);rx(VERSION,1,1,NULL,0);mi8_glink_poll_once(g);assert(!g->broken);mi8_glink_destroy(g);
+ assert(allocs==0);return 0;
+}
+'''
+ c=dev/'test.c';c.write_text(harness);exe=root/'test'
+ subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-pthread',str(c),'-o',str(exe)],check=True)
+ subprocess.run([str(exe)],check=True,env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0'})
+ assert 'mss_glink_test = mode == 8;' in source
+ assert source.index('equuleus_glink_probe();') < source.index('done:\n\t(void)dsp_ask_to_stop',source.index('equuleus_glink_probe();'))
+ adapter=source[source.index('/* 0153:'):source.index('#define MAX_SEGMENTS 48u')]
+ assert 'ml_io_' not in adapter and 'assign_mem' not in adapter and 'sweet_ufs' not in adapter
+ print('0153 replay; actual GLINK VERSION/IPCRTR/intents/QRTR hello/service add/remove; malformed FIFO/commands/wrap and ASan/UBSan checks passed')
+ prefix=r'''
+#include <assert.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <errno.h>
+#include "equuleus_glink.h"
+#define SMEM_SIZE 65536u
+#define SMEM_MODEM 1
+#define IPC_GLINK_MODEM (1u<<12)
+#define NSEC_PER_USEC 1000
+#define DSP_FATAL 1u
+struct smp2p {unsigned state;};
+static uint8_t memory[SMEM_SIZE];static uint64_t elapsed;static unsigned writes,bells,scenario;
+static void say(const char *f,...) {(void)f;}
+static void settle(void) {}
+static uint64_t now_us(void) {return elapsed;}
+static void delay_for_interval(unsigned n,unsigned unit) {assert(unit==1000);elapsed+=n;}
+static void ring(unsigned mask) {assert(mask==IPC_GLINK_MODEM);bells++;}
+static bool smem_peek(uint64_t off,void *out,uint32_t n) {if(off+n>SMEM_SIZE || scenario==5)return false;memcpy(out,memory+off,n);return true;}
+static void smem_poke(uint32_t off,uint32_t v) {assert(off==0x1004 || off==0x1008 || (off>=0x2000 && off+4<=0x3000));memcpy(memory+off,&v,4);writes++;}
+static uint32_t adsp_item(uint32_t item,uint32_t *size) {
+ if(scenario==1)return 0;
+ *size=item==478?32:4096;
+ if(scenario==2 && item==480)return 0x2000;
+ if(scenario==3 && item==480)return SMEM_SIZE-8;
+ return item==478?0x1000:item==479?0x2000:0x4000;
+}
+static bool dsp_words(struct smp2p *s) {s->state=scenario==4?1:2;return true;}
+static uint32_t dsp_state(const struct smp2p *s) {return s->state;}
+static void dsp_listen(const struct smp2p *s) {(void)s;}
+'''
+ main=r'''
+int main(void) {
+ for(scenario=0;scenario<6;scenario++) {
+  memset(memory,0,sizeof(memory));elapsed=writes=bells=0;
+  equuleus_glink_probe();assert(elapsed<=10000000ull);
+  if(scenario==1 || scenario==2 || scenario==3)assert(writes==0 && bells==0);
+ }
+ scenario=0;struct eq_glink_io io;assert(eq_glink_layout(&io));
+ unsigned before=writes;eq_glink_write(&io,0x4000,42);assert(io.fault && writes==before);
+ unsigned old=bells;eq_glink_ring(&io);assert(bells==old);
+ assert(eq_glink_layout(&io));uint8_t out[16];memset(out,1,sizeof(out));
+ eq_glink_read(&io,SMEM_SIZE-1,out,16);assert(io.fault);for(unsigned i=0;i<16;i++)assert(out[i]==0);
+ assert(!eq_glink_range(0xfffffff0,32,0xfffffff0,32));
+ assert(!eq_glink_range(0x1fff,4,0x2000,4096));
+ assert(!eq_glink_range(0x2fff,4,0x2000,4096));
+ assert(eq_glink_range(0x2ffc,4,0x2000,4096));
+ mss_glink_test=true;assert(mss_glink_test);
+ return 0;
+}
+'''
+ c=dev/'adapter.c';c.write_text(prefix+adapter+main)
+ subprocess.run(['cc','-std=gnu11','-DMI8_GLINK_HOST_TEST','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-pthread',str(c),str(dev/'equuleus_glink.c'),'-o',str(exe)],check=True)
+ subprocess.run([str(exe)],check=True,env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0'})
+ print('Actual equuleus adapter: bounded probe, missing/overlapping/out-of-range items, fatal DSP, read failure and write allowlist checks passed')
+ gate=source[source.index('void\nequuleus_mss_probe(void)'):].split('#endif',1)[0]
+ prefix=r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <stddef.h>
+#include <string.h>
+static unsigned mode,calls,survey,rails;static bool board,mss_halt_all,mss_full_test,mss_glink_test;
+static bool sweet_board_is(const char *s) {assert(!strcmp(s,"xiaomi,equuleus"));return board;}
+static bool PE_parse_boot_argn(const char *s,void *v,size_t n) {assert(!strcmp(s,"sweetmss") && n==sizeof(mode));memcpy(v,&mode,n);return true;}
+static void say(const char *s,...) {(void)s;}
+static void mss_w2a(void) {survey++;}
+static void mss_w2bc(unsigned n) {assert(n==2);rails++;}
+static void mss_run_mba(void) {calls++;assert(mss_halt_all==(mode==7));assert(mss_full_test==(mode>=6));assert(mss_glink_test==(mode==8));}
+'''
+ main=r'''
+int main(int argc,char **argv) {
+ assert(argc==3);mode=(unsigned)atoi(argv[1]);board=atoi(argv[2]);
+ equuleus_mss_probe();equuleus_mss_probe();
+ assert(calls==(unsigned)(board && mode>=5 && mode<=8));
+ assert(rails==(unsigned)(board && mode==2));
+ assert(survey==(unsigned)(board && (mode==1 || mode==2 || (mode>=5 && mode<=8))));
+ return 0;
+}
+'''
+ c.write_text(prefix+gate+main)
+ subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror',str(c),'-o',str(exe)],check=True)
+ for mode in [0,1,2,3,5,6,7,8,9]:
+  for board in [0,1]:subprocess.run([str(exe),str(mode),str(board)],check=True)
+ print('18 actual boot-entry mode/board cases passed, including one-shot gate and mode8-only GLINK enable')
