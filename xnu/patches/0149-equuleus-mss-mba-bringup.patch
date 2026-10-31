@@ -1,12 +1,12 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 7198490..a1447a6 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -116,6 +116,7 @@ bsd/dev/sweet_smmu.c			standard
+@@ -117,7 +117,8 @@
  bsd/dev/sweet_a630.c			standard
  bsd/dev/sweet_a630_pas.c			standard
  bsd/dev/beryllium_wlan.c		standard
 +bsd/dev/equuleus_mss.c		standard
+ bsd/dev/beryllium_bt_hci.c		standard
  bsd/dev/mem.c				standard
  bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
