@@ -136,7 +136,10 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          python3 ../tools/equuleus-ci-verify.py prepare build.sh
+          bash build.sh
+          python3 ../tools/equuleus-ci-verify.py verify .
 
       - name: ccache stats
         if: always()

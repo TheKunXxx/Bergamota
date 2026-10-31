@@ -1,0 +1,1271 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 7198490..a1447a6 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,7 @@ bsd/dev/sweet_smmu.c			standard
+ bsd/dev/sweet_a630.c			standard
+ bsd/dev/sweet_a630_pas.c			standard
+ bsd/dev/beryllium_wlan.c		standard
++bsd/dev/equuleus_mss.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index 29a1133..94dd26c 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -56,6 +56,7 @@ extern int sweet_ufs_part_size(const char *name, uint8_t *lun, uint64_t *bytes);
+ extern int sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable);
+ extern int sweet_rpmh_lookup(const char *res, uint32_t *address);
+ void beryllium_wlan_init(void);
++extern void equuleus_mss_probe(void);
+ /* bsd/dev/beryllium_bt_hci.c: the kernel control the iOS userland talks to */
+ struct bt_hci_ops {
+ 	bool (*tx)(const uint8_t *pkt, unsigned len);
+@@ -2798,6 +2799,8 @@ wl_thread(void *arg, wait_result_t wr)
+ 		wl_bt();
+ 	} else if (wl.stage == 3) {
+ 		wl_inventory();
++	} else if (wl.stage == 4) {
++		equuleus_mss_probe();
+ 	}
+ out:
+ 	(void)thread_terminate(current_thread());
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 6b25519..0992a2d 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -14,6 +14,9 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ int sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable);
++int sweet_rpmh_bus_acquire(void);
++void sweet_rpmh_bus_release(void);
++void sweet_rpmh_bus_poison(void);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -447,4 +450,28 @@ out:
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++/* Share the existing RPMh transaction lock with the equuleus MSS probe. */
++int
++sweet_rpmh_bus_acquire(void)
++{
++    if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) { return EBUSY; }
++    if (rh_poisoned) {
++        __atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++        return EIO;
++    }
++    return 0;
++}
++
++void
++sweet_rpmh_bus_poison(void)
++{
++    rh_poisoned = true;
++}
++
++void
++sweet_rpmh_bus_release(void)
++{
++    __atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++}
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- /dev/null
++++ b/bsd/dev/equuleus_mss.c
+@@ -0,0 +1,1192 @@
++/* SPDX-License-Identifier: APSL-2.0
++ * SDM845 MBA bring-up, adapted from yanei's dipper-xnu mi8_rproc.c.
++ * Donor: 4e82c709ea42ebb509fa101b52972fdc890b873e.
++ * See docs/EQUULEUS_MSS.md for provenance and the restricted test scope.
++ * No modem image, GLINK, WLAN, or persistent partition writes in this port.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <mach/vm_param.h>
++#include <vm/memory_types.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <sys/errno.h>
++#include <sys/param.h>
++#include <sys/systm.h>
++#include "sweet_board.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
++extern vm_offset_t io_map(vm_map_offset_t, vm_size_t, unsigned int, vm_prot_t, bool);
++extern uint64_t kvtophys(vm_offset_t);
++extern int sweet_ufs_read_part(const char *, uint64_t, void *, uint64_t);
++extern int sweet_rpmh_bus_acquire(void);
++extern void sweet_rpmh_bus_release(void);
++extern void sweet_rpmh_bus_poison(void);
++void equuleus_mss_probe(void);
++
++static int say(const char *format, ...) __printflike(1, 2);
++static int
++say(const char *format, ...)
++{
++    char line[400];
++    va_list ap;
++    va_start(ap, format);
++    int n = vsnprintf(line, sizeof(line), format, ap);
++    va_end(ap);
++    printf("%s", line);
++    return n;
++}
++
++static const uint32_t pause_ms = 20;
++
++static void
++announce(uint32_t step, const char *what)
++{
++	say("eqmss: step %u: %s\n", step, what);
++	if (pause_ms) {
++		delay_for_interval(pause_ms, NSEC_PER_MSEC);
++	}
++}
++
++static uint32_t __attribute__((noinline))
++rd(vm_offset_t address)
++{
++	uint32_t value;
++
++	__asm__ volatile ("ldr %w0, [%1]" : "=r" (value) : "r" (address) : "memory");
++	return value;
++}
++
++static void __attribute__((noinline))
++wr(vm_offset_t address, uint32_t value)
++{
++	__asm__ volatile ("str %w0, [%1]" : : "r" (value), "r" (address) : "memory");
++}
++
++static void
++settle(void)
++{
++	__asm__ volatile ("dsb sy");
++}
++
++
++static struct {
++	bool ok;
++	uint32_t spc, cluster_bytes, root_bytes, clusters;
++	uint64_t fat_off, root_off, data_off;
++	uint16_t *fat;
++	uint32_t fat_bytes;
++} fs;
++
++struct fs_file {
++	uint32_t first, size;
++	bool dir;
++};
++
++static int
++fs_read(uint64_t offset, void *dst, uint64_t len)
++{
++	return sweet_ufs_read_part("modem", offset, dst, len);
++}
++
++static bool
++fs_mount(void)
++{
++	uint8_t *boot;
++	uint32_t bps, reserved, nfats, root_entries, total, fatsz;
++	int error;
++
++	if (fs.ok) {
++		return true;
++	}
++	boot = kalloc_data(4096, Z_WAITOK | Z_ZERO);
++	if (boot == NULL) {
++		return false;
++	}
++	if ((error = fs_read(0, boot, 4096)) != 0) {
++		say("eqmss: fs: the first block of 'modem' is not read (%d)\n", error);
++		kfree_data(boot, 4096);
++		return false;
++	}
++	bps = boot[11] | boot[12] << 8;
++	fs.spc = boot[13];
++	reserved = boot[14] | boot[15] << 8;
++	nfats = boot[16];
++	root_entries = boot[17] | boot[18] << 8;
++	total = boot[19] | boot[20] << 8;
++	if (total == 0) {
++		total = boot[32] | boot[33] << 8 | boot[34] << 16 | (uint32_t)boot[35] << 24;
++	}
++	fatsz = boot[22] | boot[23] << 8;
++	say("eqmss: fs: 'modem': %u bytes a sector, %u sectors a cluster, %u reserved, %u FATs of %u sectors, %u root entries, %u sectors; "
++	    "type '%.8s'\n", bps, fs.spc, reserved, nfats, fatsz, root_entries, total, (const char *)boot + 54);
++	kfree_data(boot, 4096);
++	if (bps != 4096 || fs.spc == 0 || (fs.spc & (fs.spc - 1)) || nfats == 0 || fatsz == 0 || root_entries == 0 || total == 0) {
++		say("eqmss: fs: not the FAT16 this reader knows\n");
++		return false;
++	}
++	fs.cluster_bytes = bps * fs.spc;
++	fs.fat_off = (uint64_t)reserved * bps;
++	fs.fat_bytes = fatsz * bps;
++	fs.root_off = fs.fat_off + (uint64_t)nfats * fs.fat_bytes;
++	fs.root_bytes = root_entries * 32;
++	fs.root_bytes = (fs.root_bytes + bps - 1) / bps * bps;
++	fs.data_off = fs.root_off + fs.root_bytes;
++	fs.clusters = (total - (uint32_t)(fs.data_off / bps)) / fs.spc;
++	if (fs.clusters < 4085 || fs.clusters >= 65525) {
++		say("eqmss: fs: %u clusters: not FAT16\n", fs.clusters);
++		return false;
++	}
++	fs.fat = kalloc_data(fs.fat_bytes, Z_WAITOK);
++	if (fs.fat == NULL || fs_read(fs.fat_off, fs.fat, fs.fat_bytes) != 0) {
++		say("eqmss: fs: the FAT is not read\n");
++		return false;
++	}
++	fs.ok = true;
++	return true;
++}
++
++static uint32_t
++fs_next(uint32_t cluster)
++{
++	uint32_t next = cluster < fs.fat_bytes / 2 ? fs.fat[cluster] : 0xffff;
++
++	return next >= 2 && next < fs.clusters + 2 ? next : 0;
++}
++
++static uint64_t
++fs_cluster_off(uint32_t cluster)
++{
++	return fs.data_off + (uint64_t)(cluster - 2) * fs.cluster_bytes;
++}
++
++static void
++fs_name83(const char *name, uint8_t out[11])
++{
++	unsigned n = 0;
++
++	memset(out, ' ', 11);
++	for (; *name != 0 && *name != '.' && n < 8; name++, n++) {
++		out[n] = (*name >= 'a' && *name <= 'z') ? (uint8_t)(*name - 32) : (uint8_t)*name;
++	}
++	while (*name != 0 && *name != '.') {
++		name++;
++	}
++	if (*name == '.') {
++		name++;
++		for (n = 0; *name != 0 && n < 3; name++, n++) {
++			out[8 + n] = (*name >= 'a' && *name <= 'z') ? (uint8_t)(*name - 32) : (uint8_t)*name;
++		}
++	}
++}
++
++/* An entry of a directory (first cluster; 0 = the root) by its 8.3 name. Long-name entries are skipped. */
++static bool
++fs_dir_find(uint32_t dir, const char *name, struct fs_file *out, void (*each)(const uint8_t *entry))
++{
++	uint8_t want[11];
++	uint8_t *buf;
++	bool found = false;
++	uint32_t cluster = dir;
++	uint32_t bytes = dir ? fs.cluster_bytes : fs.root_bytes;
++
++	if (name != NULL) {
++		fs_name83(name, want);
++	}
++	buf = kalloc_data(bytes, Z_WAITOK);
++	if (buf == NULL) {
++		return false;
++	}
++	for (unsigned guard = 0; guard < 4096; guard++) {
++		bool end = false;
++
++		if (fs_read(dir ? fs_cluster_off(cluster) : fs.root_off, buf, bytes) != 0) {
++			break;
++		}
++		for (uint32_t at = 0; at + 32 <= bytes; at += 32) {
++			const uint8_t *e = buf + at;
++
++			if (e[0] == 0) {
++				end = true;
++				break;
++			}
++			if (e[0] == 0xe5 || e[11] == 0x0f || (e[11] & 0x08)) {
++				continue;
++			}
++			if (each != NULL) {
++				each(e);
++			}
++			if (name != NULL && memcmp(e, want, 11) == 0) {
++				out->first = e[26] | e[27] << 8;
++				out->size = e[28] | e[29] << 8 | e[30] << 16 | (uint32_t)e[31] << 24;
++				out->dir = (e[11] & 0x10) != 0;
++				found = true;
++				end = true;
++				break;
++			}
++		}
++		if (end || !dir || (cluster = fs_next(cluster)) == 0) {
++			break;
++		}
++	}
++	kfree_data(buf, bytes);
++	return found;
++}
++
++/* "image/adsp.mdt" and the like: directories of one level are all there is on this partition's use. */
++static bool
++fs_lookup(const char *path, struct fs_file *out)
++{
++	char part[16];
++	uint32_t dir = 0;
++
++	if (!fs_mount()) {
++		return false;
++	}
++	for (;;) {
++		const char *slash = strchr(path, '/');
++		size_t n = slash ? (size_t)(slash - path) : strlen(path);
++		struct fs_file f;
++
++		if (n == 0 || n >= sizeof(part)) {
++			return false;
++		}
++		memcpy(part, path, n);
++		part[n] = 0;
++		if (!fs_dir_find(dir, part, &f, NULL)) {
++			return false;
++		}
++		if (!slash) {
++			*out = f;
++			return true;
++		}
++		if (!f.dir) {
++			return false;
++		}
++		dir = f.first;
++		path = slash + 1;
++	}
++}
++
++/* Bytes [offset, offset + len) of a file, following the chain in as few reads as there are runs of clusters. */
++static int
++fs_file_read(const struct fs_file *f, uint64_t offset, void *dst, uint64_t len)
++{
++	uint8_t *out = dst;
++	uint32_t cluster = f->first, skip = (uint32_t)(offset / fs.cluster_bytes);
++
++	if (offset > f->size || len > f->size - offset) {
++		return EINVAL;
++	}
++	while (skip-- > 0 && cluster != 0) {
++		cluster = fs_next(cluster);
++	}
++	offset %= fs.cluster_bytes;
++	while (len > 0) {
++		uint32_t run = 1, last, take;
++		int error;
++
++		if (cluster == 0) {
++			return EIO;
++		}
++		last = cluster;
++		while ((uint64_t)run * fs.cluster_bytes - offset < len && fs_next(last) == last + 1 && run < 256) {
++			last++;
++			run++;
++		}
++		take = (uint32_t)MIN((uint64_t)run * fs.cluster_bytes - offset, len);
++		if ((error = fs_read(fs_cluster_off(cluster) + offset, out, take)) != 0) {
++			return error;
++		}
++		out += take;
++		len -= take;
++		offset = 0;
++		cluster = fs_next(last);
++	}
++	return 0;
++}
++
++/* The whole of a small file in memory of ours (to be given back with kfree_data(data, *size)). */
++static uint8_t *
++fs_slurp(const char *path, uint32_t *size)
++{
++	struct fs_file f;
++	uint8_t *data;
++
++	if (!fs_lookup(path, &f) || f.dir || f.size == 0 || f.size > (8u << 20)) {
++		return NULL;
++	}
++	data = kalloc_data(f.size, Z_WAITOK);
++	if (data == NULL) {
++		return NULL;
++	}
++	if (fs_file_read(&f, 0, data, f.size) != 0) {
++		kfree_data(data, f.size);
++		return NULL;
++	}
++	*size = f.size;
++	return data;
++}
++
++#define APCS_PHYS               0x17990000ul    /* dt: irq-reg-base 0x1799000c of every remote (Linux sdm845: apcs offset 12) */
++#define APCS_IPC                0x0c
++#define IPC_AOP                 (1u << 0)       /* dt: qcom,qmp-aop qcom,irq-mask */
++#define IPC_SMP2P_ADSP          (1u << 10)      /* dt: qcom,smp2p-adsp qcom,irq-bitmask 0x400 */
++#define IPC_SMP2P_MODEM         (1u << 14)
++#define IPC_GLINK_MODEM         (1u << 12)
++#define AOSS_PHYS               0x0c300000ul
++#define AOSS_SIZE               0x400u
++#define QMP_MAGIC               0x00
++#define QMP_MAGIC_VALUE         0x4d41494c
++#define QMP_VERSION             0x04
++#define QMP_THEIR_LINK          0x0c
++#define QMP_THEIR_LINK_ACK      0x10
++#define QMP_THEIR_CHANNEL       0x14
++#define QMP_THEIR_CHANNEL_ACK   0x18
++#define QMP_OUR_LINK            0x24
++#define QMP_OUR_LINK_ACK        0x28
++#define QMP_OUR_CHANNEL         0x2c
++#define QMP_OUR_CHANNEL_ACK     0x30
++#define QMP_OUR_BOX_SIZE        0x34
++#define QMP_OUR_BOX             0x38
++#define QMP_UP                  0x0000ffffu
++#define QMP_DOWN                0xffff0000u
++#define QMP_MESSAGE             64
++
++static vm_offset_t apcs_base, aoss_base;
++static uint32_t our_box;
++
++static void
++ring(uint32_t mask)
++{
++	if (apcs_base == 0) {
++		apcs_base = ml_io_map(APCS_PHYS, 0x1000);
++	}
++	settle();
++	wr(apcs_base + APCS_IPC, mask);
++}
++
++static bool
++qmp_wait(uint32_t offset, uint32_t value, uint32_t ms)
++{
++	for (uint32_t i = 0; i < ms * 10; i++) {
++		if (rd(aoss_base + offset) == value) {
++			return true;
++		}
++		delay_for_interval(100, NSEC_PER_USEC);
++	}
++	return rd(aoss_base + offset) == value;
++}
++
++/* Linux's qmp_open(): link, channel, acknowledgements; what is open already is found open. */
++static bool
++qmp_open(void)
++{
++	uint32_t box, size;
++
++	if (aoss_base == 0) {
++		aoss_base = ml_io_map(AOSS_PHYS, AOSS_SIZE);
++	}
++	if (our_box != 0) {
++		return true;
++	}
++	if (rd(aoss_base + QMP_MAGIC) != QMP_MAGIC_VALUE || rd(aoss_base + QMP_VERSION) != 1) {
++		say("eqmss: qmp: not a mailbox this knows (magic %#x, version %u)\n", rd(aoss_base + QMP_MAGIC), rd(aoss_base + QMP_VERSION));
++		return false;
++	}
++	box = rd(aoss_base + QMP_OUR_BOX);
++	size = rd(aoss_base + QMP_OUR_BOX_SIZE);
++	say("eqmss: qmp: our mailbox at +%#x, %u bytes; link %#x/%#x channel %#x/%#x (ours/their)\n", box, size, rd(aoss_base + QMP_OUR_LINK),
++	    rd(aoss_base + QMP_THEIR_LINK), rd(aoss_base + QMP_OUR_CHANNEL), rd(aoss_base + QMP_THEIR_CHANNEL));
++	if (size < QMP_MESSAGE + 4 || box < 0x3c || box + size > AOSS_SIZE || (box & 3)) {
++		say("eqmss: qmp: our mailbox is not where a message fits\n");
++		return false;
++	}
++	if (rd(aoss_base + QMP_OUR_LINK) == QMP_UP && rd(aoss_base + QMP_OUR_LINK_ACK) == QMP_UP && rd(aoss_base + QMP_OUR_CHANNEL) == QMP_UP &&
++	    rd(aoss_base + QMP_THEIR_CHANNEL) == QMP_UP && rd(aoss_base + QMP_OUR_CHANNEL_ACK) == QMP_UP) {
++		say("eqmss: qmp: the mailbox is open already\n");
++		our_box = box;
++		return true;
++	}
++	wr(aoss_base + QMP_THEIR_LINK_ACK, rd(aoss_base + QMP_THEIR_LINK));
++	wr(aoss_base + QMP_OUR_LINK, QMP_UP);
++	ring(IPC_AOP);
++	if (!qmp_wait(QMP_OUR_LINK_ACK, QMP_UP, 1000)) {
++		say("eqmss: qmp: THE AOP DOES NOT ACKNOWLEDGE OUR LINK within a second; taken down again\n");
++		wr(aoss_base + QMP_OUR_LINK, QMP_DOWN);
++		ring(IPC_AOP);
++		return false;
++	}
++	wr(aoss_base + QMP_OUR_CHANNEL, QMP_UP);
++	ring(IPC_AOP);
++	if (!qmp_wait(QMP_THEIR_CHANNEL, QMP_UP, 1000)) {
++		say("eqmss: qmp: THE AOP DOES NOT OPEN ITS CHANNEL within a second; ours is taken down again\n");
++		wr(aoss_base + QMP_OUR_CHANNEL, QMP_DOWN);
++		wr(aoss_base + QMP_OUR_LINK, QMP_DOWN);
++		ring(IPC_AOP);
++		return false;
++	}
++	wr(aoss_base + QMP_THEIR_CHANNEL_ACK, QMP_UP);
++	ring(IPC_AOP);
++	if (!qmp_wait(QMP_OUR_CHANNEL_ACK, QMP_UP, 1000)) {
++		say("eqmss: qmp: THE AOP DOES NOT ACKNOWLEDGE OUR CHANNEL within a second; taken down again\n");
++		wr(aoss_base + QMP_OUR_CHANNEL, QMP_DOWN);
++		wr(aoss_base + QMP_OUR_LINK, QMP_DOWN);
++		ring(IPC_AOP);
++		return false;
++	}
++	say("eqmss: qmp: THE MAILBOX TO THE AOP IS OPEN\n");
++	our_box = box;
++	return true;
++}
++
++/* Linux's qmp_send(). */
++static bool
++qmp_send(const char *text)
++{
++	uint32_t words[QMP_MESSAGE / 4] = { 0 };
++
++	if (!qmp_open()) {
++		return false;
++	}
++	strlcpy((char *)words, text, sizeof(words));
++	say("eqmss: qmp: telling the AOP \"%s\"\n", text);
++	if (rd(aoss_base + our_box) != 0) {
++		say("eqmss: qmp: our mailbox still holds a message of %u bytes: not sent\n", rd(aoss_base + our_box));
++		return false;
++	}
++	for (unsigned i = 0; i < QMP_MESSAGE / 4; i++) {
++		wr(aoss_base + our_box + 4 + 4 * i, words[i]);
++	}
++	wr(aoss_base + our_box, QMP_MESSAGE);
++	(void)rd(aoss_base + our_box);
++	ring(IPC_AOP);
++	if (!qmp_wait(our_box, 0, 1000)) {
++		say("eqmss: qmp: THE AOP DOES NOT TAKE THE MESSAGE within a second; taken back\n");
++		wr(aoss_base + our_box, 0);
++		return false;
++	}
++	say("eqmss: qmp: the AOP has taken it\n");
++	return true;
++}
++
++/* ---- RPMh: a rail's level, as Linux's rpmh-rsc.c asks for one (apps_rsc DRV 2; TCS 1: TCS 0 is mi8_ddr's) ---- */
++
++#define CMD_DB_PHYS             0x85fe0000UL    /* EXP-0067: where the boot loader left the command database on this phone */
++#define CMD_DB_SIZE             0x20000UL
++#define RSC_PHYS                0x179e0000ul    /* dt: mailbox@179e0000 apps_rsc, drv-id 2 */
++#define RSC_TCS_BASE            0xd00
++#define RSC_TCS(n)              (RSC_TCS_BASE + 672 * (n))
++#define RPMH_TCS                1
++
++struct cmd_db_slave {
++	uint16_t id, header_offset, data_offset, count, version, reserved[3];
++};
++struct cmd_db_header {
++	uint32_t version;
++	uint8_t magic[4];
++	struct cmd_db_slave slave[8];
++	uint32_t checksum, reserved;
++	uint8_t data[];
++};
++struct cmd_db_entry {
++	char id[8];
++	uint32_t priority[2];
++	uint32_t address;
++	uint16_t length, offset;
++};
++
++static vm_offset_t cmd_db_base, rsc_base;
++
++/* The position RPMh takes for rail `name` at the first of its levels that is at or above `level` (0: the lowest); -1: none. */
++static int
++rail_position(const char *name, uint32_t level, uint32_t *address, bool show)
++{
++	const struct cmd_db_header *db;
++	char id[8] = { 0 };
++
++	if (cmd_db_base == 0) {
++		cmd_db_base = ml_io_map(CMD_DB_PHYS, CMD_DB_SIZE);
++	}
++	db = (const struct cmd_db_header *)cmd_db_base;
++	if (!(db->magic[0] == 0xdb && db->magic[1] == 0x30 && db->magic[2] == 0x03 && db->magic[3] == 0x0c)) {
++		say("eqmss: rpmh: no command database at %#lx\n", CMD_DB_PHYS);
++		return -1;
++	}
++	strlcpy(id, name, sizeof(id));
++	for (unsigned sl = 0; sl < 8; sl++) {
++		const struct cmd_db_slave *slave = &db->slave[sl];
++		const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(db->data + slave->header_offset);
++
++		if (slave->id == 0 || slave->count > 512 ||
++		    (uint64_t)slave->header_offset + (uint64_t)slave->count * sizeof(*entry) > CMD_DB_SIZE - 0x1000) {
++			continue;
++		}
++		for (unsigned i = 0; i < slave->count; i++) {
++			const uint8_t *data;
++			char levels[160];
++			int at;
++
++			if (memcmp(entry[i].id, id, sizeof(id)) != 0) {
++				continue;
++			}
++			if ((unsigned)slave->data_offset + entry[i].offset + entry[i].length > CMD_DB_SIZE - 0x1000) {
++				return -1;
++			}
++			data = db->data + slave->data_offset + entry[i].offset;
++			if (show) {
++				at = snprintf(levels, sizeof(levels), "%s at %#x, levels:", name, entry[i].address);
++				for (unsigned l = 0; l < entry[i].length / 2u && l < 16; l++) {
++					unsigned value = data[2 * l] | data[2 * l + 1] << 8;
++
++					if (l > 0 && value == 0) {
++						break;
++					}
++					at += snprintf(levels + at, sizeof(levels) - (size_t)at, " %u", value);
++				}
++				say("eqmss: rpmh: %s\n", levels);
++			}
++			*address = entry[i].address;
++			if (level == 0) {
++				return 0;
++			}
++			if (level == 0xffffffffu) {             /* the top: the last level listed */
++				unsigned top = 0;
++
++				for (unsigned l = 0; l < entry[i].length / 2u && l < 16; l++) {
++					if (l > 0 && (data[2 * l] | data[2 * l + 1] << 8) == 0) {
++						break;
++					}
++					top = l;
++				}
++				return (int)top;
++			}
++			for (unsigned l = 0; l < entry[i].length / 2u && l < 16; l++) {
++				if ((uint32_t)(data[2 * l] | data[2 * l + 1] << 8) >= level) {
++					return (int)l;
++				}
++			}
++			return -1;
++		}
++	}
++	say("eqmss: rpmh: no \"%s\"\n", name);
++	return -1;
++}
++
++/* One request, one rail, through TCS 1 and waited for; true: RPMh said done. */
++static bool
++rpmh_write(const char *what, uint32_t address, uint32_t data)
++{
++	vm_offset_t tcs;
++	uint32_t done = 0;
++
++	if (sweet_rpmh_bus_acquire() != 0) {
++		say("eqmss: RPMh busy; transaction refused\n");
++		return false;
++	}
++	if (rsc_base == 0) {
++		rsc_base = ml_io_map(RSC_PHYS, 0x10000);
++	}
++	tcs = rsc_base + RSC_TCS(RPMH_TCS);
++	if (rd(tcs + 0x1c) != 0 || (rd(tcs + 0x14) & (1u << 24))) {
++		say("eqmss: rpmh: TCS %u is in use (control %#x, enable %#x): not touched\n", RPMH_TCS, rd(tcs + 0x14), rd(tcs + 0x1c));
++		sweet_rpmh_bus_release();
++		return false;
++	}
++	say("eqmss: rpmh: asking, through TCS %u, for %s (%#x) = %u\n", RPMH_TCS, what, address, data);
++	wr(rsc_base + RSC_TCS_BASE + 0x08, 1u << RPMH_TCS);                    /* IRQ_CLEAR */
++	wr(tcs + 0x30, (1u << 16) | (1u << 8) | 8u);                            /* write, an answer wanted, four bytes + address */
++	wr(tcs + 0x34, address);
++	wr(tcs + 0x38, data);
++	wr(tcs + 0x10, 1);                                                      /* WAIT_FOR_DONE */
++	wr(tcs + 0x1c, 1);                                                      /* CMD_ENABLE */
++	settle();
++	wr(tcs + 0x14, rd(tcs + 0x14) & ~(1u << 24));
++	wr(tcs + 0x14, rd(tcs + 0x14) | (1u << 16));                            /* active mode */
++	wr(tcs + 0x14, rd(tcs + 0x14) | (1u << 24));                            /* trigger */
++	for (unsigned t = 0; t < 20000; t++) {
++		done = (rd(rsc_base + RSC_TCS_BASE + 0x04) & (1u << RPMH_TCS)) || (rd(tcs + 0x3c) & (1u << 16));     /* the IRQ bit, or the command's COMPL (EXP-0191) */
++		if (done) {
++			break;
++		}
++		delay_for_interval(10, NSEC_PER_USEC);
++	}
++	say("eqmss: rpmh: %s; command status %#x\n", done ? "DONE" : "NOT SAID DONE", rd(tcs + 0x3c));
++	if (!done) {
++		/* Hardware may still own the TCS. Do not reset it or let another client reuse it. */
++		sweet_rpmh_bus_poison();
++		sweet_rpmh_bus_release();
++		say("eqmss: RPMh completion unknown; shared bus disabled until reboot\n");
++		return false;
++	}
++	wr(rsc_base + RSC_TCS_BASE + 0x08, 1u << RPMH_TCS);
++	wr(tcs + 0x14, 0);
++	wr(tcs + 0x1c, 0);
++	settle();
++	sweet_rpmh_bus_release();
++	return done != 0;
++}
++
++static bool
++rpmh_level(const char *name, uint32_t level)
++{
++	uint32_t address = 0;
++	int position = rail_position(name, level, &address, true);
++
++	if (position < 0 || address == 0) {
++		say("eqmss: rpmh: no position for %s at level %u\n", name, level);
++		return false;
++	}
++	return rpmh_write(name, address, (uint32_t)position);
++}
++
++static bool
++rpmh_level_pos(const char *name, uint32_t level)
++{
++	return rpmh_level(name, level);
++}
++
++#define SCM_64 (1ull << 30)
++#define SCM_SIP (2ull << 24)
++#define SCM_CALL(service, command) ((uint64_t)(service) << 8 | (command))
++
++static int32_t
++scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third, uint64_t fourth, uint64_t *answer)
++{
++	uint64_t session = 0;
++
++	function |= SCM_64 | SCM_SIP;
++	say("eqmss: asking TrustZone %s: smc %#llx, arguments %#llx, %#llx, %#llx, %#llx\n", what, function, first, second, third, fourth);
++	for (int i = 0; i < 100; i++) {
++		register uint64_t x0 __asm__("x0") = i == 0 ? function : 1;
++		register uint64_t x1 __asm__("x1") = arguments;
++		register uint64_t x2 __asm__("x2") = first;
++		register uint64_t x3 __asm__("x3") = second;
++		register uint64_t x4 __asm__("x4") = third;
++		register uint64_t x5 __asm__("x5") = fourth;
++		register uint64_t x6 __asm__("x6") = session;
++		register uint64_t x7 __asm__("x7") = 0;
++
++		__asm__ volatile (".inst 0xd4000003" /* smc #0 */ : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5), "+r" (x6), "+r" (x7) : :
++		    "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++		session = x6;
++		if (x0 != 1) {
++			say("eqmss: TrustZone returns %d, answer %#llx\n", (int32_t)x0, x1);
++			*answer = x1;
++			return (int32_t)x0;
++		}
++	}
++	say("eqmss: TrustZone keeps saying the call was interrupted\n");
++	return -1;
++}
++
++#define GCC_PHYS                0x00100000ul
++#define GCC_SIZE                0x000a0000u     /* the registers below are all under 0x8b000 */
++#define GCC_VOTE                0x52004         /* the application processor's vote word (Linux: apcs_clk_en_reg) */
++#define TCSR_HALT_PHYS          0x01f60000ul    /* dt: halt_q6 0x1f63000, halt_nc 0x1f64000, halt_modem 0x1f65000 */
++
++struct gcc_clock {
++	const char *name;
++	uint32_t enable_reg, enable_bit;        /* the word and bit that turn it on */
++	uint32_t halt_reg;                      /* its CLK_OFF word (bit 31); 0: none, Linux waits a moment instead */
++};
++/* in Linux's order: proxy (prng), reset (iface, snoc_axi), active (bus, mem, gpll0_mss, mnoc_axi); gcc-sdm845.c */
++static const struct gcc_clock mss_clocks[] = {
++	{ "prng_ahb",          GCC_VOTE, 13, 0x34004 },
++	{ "mss_cfg_ahb",       0x8a000, 0, 0x8a000 },
++	{ "mss_snoc_axi",      0x8a150, 0, 0x8a150 },
++	{ "mss_q6_memnoc_axi", 0x8a154, 0, 0x8a154 },
++	{ "boot_rom_ahb",      GCC_VOTE, 10, 0x38004 },
++	{ "mss_gpll0_div",     GCC_VOTE, 17, 0 },
++	{ "mss_mfab_axis",     0x8a004, 0, 0x8a004 },
++};
++#define MSS_CLOCKS ((unsigned)(sizeof(mss_clocks) / sizeof(mss_clocks[0])))
++
++static vm_offset_t gcc_base;
++
++static vm_offset_t
++gcc(void)
++{
++	if (gcc_base == 0) {
++		gcc_base = ml_io_map(GCC_PHYS, GCC_SIZE);
++	}
++	return gcc_base;
++}
++
++static bool
++gcc_is_on(const struct gcc_clock *c)
++{
++	bool enabled = (rd(gcc() + c->enable_reg) >> c->enable_bit) & 1;
++
++	return enabled && (c->halt_reg == 0 || !(rd(gcc() + c->halt_reg) & (1u << 31)));
++}
++
++static void
++gcc_show(void)
++{
++	char line[300];
++	int at = 0;
++
++	for (unsigned i = 0; i < MSS_CLOCKS; i++) {
++		const struct gcc_clock *c = &mss_clocks[i];
++
++		at += snprintf(line + at, sizeof(line) - (size_t)at, " %s=%s", c->name, gcc_is_on(c) ? "on" : "off");
++	}
++	say("eqmss: mss: clocks:%s; vote word %#x\n", line, rd(gcc() + GCC_VOTE));
++}
++
++/* Linux's clk_branch2 enable: set the bit, then wait for CLK_OFF to clear. */
++static bool
++gcc_enable(const struct gcc_clock *c)
++{
++	uint32_t was = rd(gcc() + c->enable_reg);
++
++	wr(gcc() + c->enable_reg, was | (1u << c->enable_bit));
++	settle();
++	if (c->halt_reg == 0) {
++		delay_for_interval(5, NSEC_PER_USEC);
++		return true;
++	}
++	for (unsigned t = 0; t < 2000; t++) {
++		if (!(rd(gcc() + c->halt_reg) & (1u << 31))) {
++			return true;
++		}
++		delay_for_interval(1, NSEC_PER_USEC);
++	}
++	say("eqmss: mss: clock %s does not come on: halt word %#x\n", c->name, rd(gcc() + c->halt_reg));
++	return false;
++}
++
++static void
++gcc_disable(const struct gcc_clock *c)
++{
++	wr(gcc() + c->enable_reg, rd(gcc() + c->enable_reg) & ~(1u << c->enable_bit));
++	settle();
++}
++
++static void
++mss_w2a(void)
++{
++	static const char *const rails[] = { "cx.lvl", "mx.lvl", "mss.lvl" };
++	vm_offset_t tcsr;
++	uint32_t address;
++
++	announce(1, "(W2a) reads the modem subsystem's GCC clocks, RPMh rails and TCSR halt ports");
++	gcc_show();
++	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
++		rail_position(rails[i], 0, &address, true);
++	}
++	announce(1, "(W2a) reads TCSR 0x1f63000.. (HALTREQ, HALTACK, IDLE of q6, nc, modem)");
++	tcsr = ml_io_map(TCSR_HALT_PHYS, 0x10000);
++	for (unsigned i = 0; i < 3; i++) {
++		static const char *const names[] = { "q6", "nc", "modem" };
++		vm_offset_t port = tcsr + 0x3000 + 0x1000 * i;
++
++		say("eqmss: mss: halt port %s: req %#x ack %#x idle %#x\n", names[i], rd(port), rd(port + 4), rd(port + 8));
++	}
++	say("eqmss: mss: W2a done: nothing was written\n");
++}
++
++#define RMB_PHYS                0x04180000ul
++#define RMB_PBL_STATUS          0x04
++#define RMB_MBA_STATUS          0x0c
++#define RMB_MSS_STATUS          0x40
++#define RMB_ALT_RESET           0x44
++#define PDC_PHYS                0x0b2e0000ul
++#define PDC_SYNC_RESET          0x100           /* Linux reset-qcom-pdc.c, sdm845: bit 9 is the modem */
++#define PDC_MODEM_BIT           (1u << 9)
++#define AOSS_CC_PHYS            0x0c2b0000ul    /* AOSS_CC_MSS_RESTART: 1 holds the modem in reset, 0 lets go */
++
++static void
++us(uint32_t n)
++{
++	delay_for_interval(n, NSEC_PER_USEC);
++}
++
++/* Linux q6v5_reset_deassert, alt-reset path (qcom_q6v5_mss.c); each register is shown before it is written. */
++static void
++mss_reset_deassert(vm_offset_t rmb, vm_offset_t pdc, vm_offset_t restart)
++{
++	wr(pdc + PDC_SYNC_RESET, rd(pdc + PDC_SYNC_RESET) | PDC_MODEM_BIT);
++	wr(rmb + RMB_ALT_RESET, 1);
++	wr(restart, 1);
++	settle();
++	us(300);
++	wr(restart, 0);
++	settle();
++	us(300);
++	wr(rmb + RMB_ALT_RESET, 0);
++	wr(pdc + PDC_SYNC_RESET, rd(pdc + PDC_SYNC_RESET) & ~PDC_MODEM_BIT);
++	settle();
++}
++
++/* Linux q6v5_reset_assert, alt-reset path. */
++static void
++mss_reset_assert(vm_offset_t pdc, vm_offset_t restart)
++{
++	wr(pdc + PDC_SYNC_RESET, rd(pdc + PDC_SYNC_RESET) | PDC_MODEM_BIT);
++	wr(restart, 1);
++	settle();
++	us(300);
++	wr(restart, 0);
++	settle();
++	us(300);
++	wr(pdc + PDC_SYNC_RESET, rd(pdc + PDC_SYNC_RESET) & ~PDC_MODEM_BIT);
++	settle();
++}
++
++static bool
++mss_clocks_on(unsigned from, unsigned to, bool *turned)
++{
++	for (unsigned i = from; i < to; i++) {
++		if (gcc_is_on(&mss_clocks[i])) {
++			continue;                       /* on already (someone else's): left as it is, and not turned off after */
++		}
++		turned[i] = true;
++		if (!gcc_enable(&mss_clocks[i])) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static void
++mss_clocks_off(unsigned from, unsigned to, const bool *turned)
++{
++	for (unsigned i = to; i-- > from;) {
++		if (turned[i]) {
++			gcc_disable(&mss_clocks[i]);
++		}
++	}
++}
++
++/*
++ * W2b (level 2): rails and clocks. W2c (level 3): between the reset clocks and the active clocks, as in Linux, take the
++ * modem out of reset and read the RMB. The Q6 is never started (BOOT_CORE_START is not written).
++ */
++static void
++mss_w2bc(uint32_t level)
++{
++	bool turned[MSS_CLOCKS] = { false };
++	bool ok = true;
++	uint32_t address;
++
++	announce(2, "(W2b) QMP 'modem on', RPMh cx/mx/mss at their tops, then the GCC clocks on, read back, off again");
++	if (!qmp_send("{class: image, res: load_state, name: modem, val: on}")) {
++		return;
++	}
++	ok = rpmh_level_pos("cx.lvl", 0xffffffffu) && rpmh_level_pos("mx.lvl", 0xffffffffu) && rpmh_level_pos("mss.lvl", 0xffffffffu);
++	if (!ok) {
++		say("eqmss: mss: a rail was not set: the clocks are not touched\n");
++		goto out;
++	}
++	ok = mss_clocks_on(0, 3, turned);               /* proxy (prng), reset (iface, snoc_axi) */
++	if (ok && level >= 3) {
++		vm_offset_t rmb = ml_io_map(RMB_PHYS, 0x1000);
++		vm_offset_t pdc = ml_io_map(PDC_PHYS, 0x1000);
++		vm_offset_t restart = ml_io_map(AOSS_CC_PHYS, 0x1000);
++
++		announce(3, "(W2c) reads RMB ALT_RESET (+0x44) with the reset clocks on, nothing written yet");
++		say("eqmss: mss: rmb alt_reset %#x; pdc sync_reset %#x; aoss mss_restart %#x\n", rd(rmb + RMB_ALT_RESET), rd(pdc + PDC_SYNC_RESET), rd(restart));
++		announce(3, "(W2c) takes the modem out of reset: PDC bit 9 set, ALT_RESET 1, MSS_RESTART 1 then 0, ALT_RESET 0, PDC bit 9 clear");
++		mss_reset_deassert(rmb, pdc, restart);
++		say("eqmss: mss: reset sequence done: rmb alt_reset %#x; pdc %#x; mss_restart %#x\n", rd(rmb + RMB_ALT_RESET), rd(pdc + PDC_SYNC_RESET), rd(restart));
++		ok = mss_clocks_on(3, MSS_CLOCKS, turned);      /* active (bus, mem, gpll0_mss, mnoc_axi) */
++		if (ok) {
++			announce(3, "(W2c) reads RMB PBL_STATUS, MBA_STATUS, MSS_STATUS (the Q6 is not started)");
++			say("eqmss: mss: rmb pbl_status %#x mba_status %#x mss_status %#x image %#x\n", rd(rmb + RMB_PBL_STATUS), rd(rmb + RMB_MBA_STATUS), rd(rmb + RMB_MSS_STATUS), rd(rmb));
++		}
++		mss_clocks_off(3, MSS_CLOCKS, turned);
++		announce(3, "(W2c) puts the modem back into reset (Linux q6v5_reset_assert) before the reset clocks go");
++		mss_reset_assert(pdc, restart);
++		say("eqmss: mss: back in reset: pdc %#x; mss_restart %#x\n", rd(pdc + PDC_SYNC_RESET), rd(restart));
++	} else if (ok) {
++		ok = mss_clocks_on(3, MSS_CLOCKS, turned);
++	}
++	gcc_show();
++	mss_clocks_off(0, 3, turned);
++	mss_clocks_off(3, MSS_CLOCKS, turned);
++	say("eqmss: mss: the clocks it turned on are off again\n");
++	gcc_show();
++out:
++	rpmh_level_pos("mss.lvl", 0);
++	rail_position("mss.lvl", 0, &address, false);
++	qmp_send("{class: image, res: load_state, name: modem, val: off}");
++	say("eqmss: mss: W2%c done: %s\n", level >= 3 ? 'c' : 'b', ok ? (level >= 3 ? "reset sequence and RMB read went through" : "all seven clocks came on and went off") : "A STEP FAILED");
++}
++
++#define SCM_MP_ASSIGN           SCM_CALL(0xc, 0x16)
++#define SCM_MP_ASSIGN_ARGS      0x1117          /* QCOM_SCM_ARGS(7, RO, VAL, RO, VAL, RO, VAL, VAL) */
++#define VMID_HLOS               3
++#define VMID_MSS_MSA            15
++#define PERM_RW                 6
++#define PERM_RWX                7
++#define MBA_MEMORY              0x96900000u
++#define MBA_SIZE                0x00200000u
++#define MPSS_MEMORY             0x8e400000u
++#define MPSS_SIZE               0x07800000u
++
++static vm_offset_t assign_page;
++
++/* Linux q6v5_xfer_mem_ownership + qcom_scm_assign_mem: *current is the bit mask of VMIDs that own the region now. */
++static bool
++assign_owners(const char *name, uint32_t address, uint32_t size, uint64_t *current, uint64_t next)
++{
++	struct {
++		uint32_t vmid, perm;
++		uint64_t ctx;
++		uint32_t ctx_size, unused;
++	} *dest;
++	uint32_t *src;
++	uint64_t *region, *extra, answer = ~0ull, phys;
++	unsigned sources = 0, dests = 0;
++	int32_t result;
++
++	if (next == *current) {
++		return true;
++	}
++	if (assign_page == 0 && kmem_alloc(kernel_map, &assign_page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		say("eqmss: mss: no memory for the assign call\n");
++		return false;
++	}
++	memset((void *)assign_page, 0, PAGE_SIZE);
++	src = (uint32_t *)assign_page;                          /* +0: the VMIDs that own it now */
++	region = (uint64_t *)(assign_page + 0x40);              /* +0x40: address, size */
++	dest = (void *)(assign_page + 0x80);                    /* +0x80: the owners to be */
++	extra = (uint64_t *)(assign_page + 0x200);              /* +0x200: arguments 3..9 that do not fit in registers */
++	for (unsigned b = 0; b < 64; b++) {
++		if (*current & (1ull << b)) {
++			src[sources++] = b;
++		}
++	}
++	region[0] = address;
++	region[1] = size;
++	for (unsigned b = 0; b < 64; b++) {
++		if (next & (1ull << b)) {
++			dest[dests].vmid = b;
++			dest[dests++].perm = b == VMID_HLOS ? PERM_RWX : PERM_RW;
++		}
++	}
++	phys = kvtophys(assign_page);
++	extra[0] = sources * 4;
++	extra[1] = phys + 0x80;
++	extra[2] = dests * (uint32_t)sizeof(*dest);
++	extra[3] = 0;
++	for (vm_offset_t line = assign_page; line < assign_page + PAGE_SIZE; line += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
++	}
++	settle();
++	say("eqmss: mss: %s %#x..%#x: owners %#llx -> %#llx\n", name, address, address + size, *current, next);
++	result = scm("to assign the modem's memory", SCM_MP_ASSIGN, SCM_MP_ASSIGN_ARGS, phys + 0x40, 16, phys, phys + 0x200, &answer);
++	if (result != 0 || answer != 0) {
++		say("eqmss: mss: MP_ASSIGN of %s FAILED (%d, %#llx): the owners stay %#llx\n", name, result, answer, *current);
++		return false;
++	}
++	*current = next;
++	return true;
++}
++
++static bool
++assign_mem(const char *name, uint32_t address, uint32_t size, uint64_t *current, bool local, bool remote)
++{
++	return assign_owners(name, address, size, current, (local ? 1ull << VMID_HLOS : 0) | (remote ? 1ull << VMID_MSS_MSA : 0));
++}
++
++#define QDSP6SS_PHYS            0x04080000ul
++#define QDSP6SS_SLEEP           0x3c
++#define QDSP6SS_BOOT_CORE_START 0x400
++#define QDSP6SS_BOOT_CMD        0x404
++#define Q6SS_CBCR_CLKEN         (1u << 0)
++#define Q6SS_CBCR_CLKOFF        (1u << 31)
++
++/* Linux q6v5proc_halt_axi_port (it waits 100 ms for the ack; here 1 s, EXP-0198); true if the port is idle afterwards. */
++static bool
++halt_port(const char *name, vm_offset_t port)
++{
++	uint32_t ack = 0, waited = 0;
++
++	if (rd(port + 8)) {
++		say("eqmss: mss: halt port %s is idle already\n", name);
++		return true;
++	}
++	wr(port, 1);
++	for (; waited < 1000 && !(ack = rd(port + 4)); waited++) {
++		delay_for_interval(1, NSEC_PER_MSEC);
++	}
++	say("eqmss: mss: halt port %s: ack %#x after %u ms, idle %#x\n", name, ack, waited, rd(port + 8));
++	wr(port, 0);
++	return rd(port + 8) != 0;
++}
++
++static void
++mss_run_mba(void)
++{
++	bool turned[MSS_CLOCKS] = { false };
++	bool rails = false, qmp = false, released = false, ok = false;
++	uint64_t mba_owners = 1ull << VMID_HLOS, mpss_owners = 1ull << VMID_HLOS;
++	vm_offset_t rmb = 0, pdc = 0, restart = 0, q6 = 0, tcsr = 0, image;
++	uint8_t *mba_file;
++	uint32_t file_size = 0, value;
++	uint32_t address;
++	bool halted = true;
++
++	announce(5, "(W2e) writes mba.mbn into the MBA region, then brings the modem up as Linux q6v5_mba_load does and starts its Q6 (no modem image)");
++	mba_file = fs_slurp("image/mba.mbn", &file_size);
++	if (mba_file == NULL || file_size > MBA_SIZE) {
++		say("eqmss: mss: mba.mbn not read or too big\n");
++		if (mba_file != NULL) { kfree_data(mba_file, file_size); }
++		return;
++	}
++	image = io_map(MBA_MEMORY, MBA_SIZE, VM_WIMG_WCOMB, VM_PROT_READ | VM_PROT_WRITE, true);
++	if (image == 0) {
++		kfree_data(mba_file, file_size);
++		return;
++	}
++	memcpy((void *)image, mba_file, file_size);
++	settle();
++	if (memcmp((void *)image, mba_file, file_size) != 0) {
++		say("eqmss: mss: THE MBA IMAGE READS BACK DIFFERENTLY: stops\n");
++		ml_io_unmap(image, MBA_SIZE);
++		kfree_data(mba_file, file_size);
++		return;
++	}
++	say("eqmss: mss: mba.mbn (%u bytes) is in the MBA region and reads back the same\n", file_size);
++
++	ml_io_unmap(image, MBA_SIZE);                   /* the region goes to the MSS: nothing of ours may touch it */
++	kfree_data(mba_file, file_size);
++
++	rmb = ml_io_map(RMB_PHYS, 0x1000);
++	pdc = ml_io_map(PDC_PHYS, 0x1000);
++	restart = ml_io_map(AOSS_CC_PHYS, 0x1000);
++	q6 = ml_io_map(QDSP6SS_PHYS, 0x1000);
++	tcsr = ml_io_map(TCSR_HALT_PHYS, 0x10000);
++
++	qmp = qmp_send("{class: image, res: load_state, name: modem, val: on}");
++	if (!qmp) {
++		return;
++	}
++	rails = rpmh_level_pos("cx.lvl", 0xffffffffu) && rpmh_level_pos("mx.lvl", 0xffffffffu) && rpmh_level_pos("mss.lvl", 0xffffffffu);
++	if (!rails || !mss_clocks_on(0, 3, turned)) {
++		goto out;
++	}
++	announce(5, "(W2e) takes the modem out of reset");
++	mss_reset_deassert(rmb, pdc, restart);
++	released = true;
++	if (!mss_clocks_on(3, MSS_CLOCKS, turned)) {
++		goto out;
++	}
++	announce(5, "(W2e) hands the modem region and the MBA region to the MSS");
++	if (!assign_mem("mpss", MPSS_MEMORY, MPSS_SIZE, &mpss_owners, false, true) || !assign_mem("mba", MBA_MEMORY, MBA_SIZE, &mba_owners, false, true)) {
++		goto out;
++	}
++	wr(rmb, MBA_MEMORY);
++	announce(5, "(W2e) starts the Q6: SLEEP clock, BOOT_CORE_START, BOOT_CMD; waits for the boot FSM, the PBL and the MBA");
++	wr(q6 + QDSP6SS_SLEEP, rd(q6 + QDSP6SS_SLEEP) | Q6SS_CBCR_CLKEN);
++	settle();
++	for (unsigned t = 0; t < 2000 && (rd(q6 + QDSP6SS_SLEEP) & Q6SS_CBCR_CLKOFF); t++) {
++		delay_for_interval(1, NSEC_PER_USEC);
++	}
++	value = rd(q6 + QDSP6SS_SLEEP);
++	say("eqmss: mss: QDSP6SS sleep clock word %#x (%s)\n", value, value & Q6SS_CBCR_CLKOFF ? "STILL OFF" : "on");
++	if (value & Q6SS_CBCR_CLKOFF) {
++		goto out;
++	}
++	wr(q6 + QDSP6SS_BOOT_CORE_START, 1);
++	wr(q6 + QDSP6SS_BOOT_CMD, 1);
++	settle();
++	for (unsigned t = 0; t < 2000 && !(rd(rmb + RMB_MSS_STATUS) & 1); t++) {
++		delay_for_interval(10, NSEC_PER_USEC);
++	}
++	say("eqmss: mss: boot FSM: MSS_STATUS %#x\n", rd(rmb + RMB_MSS_STATUS));
++	if (!(rd(rmb + RMB_MSS_STATUS) & 1)) {
++		say("eqmss: mss: THE BOOT FSM DID NOT COMPLETE\n");
++		goto out;
++	}
++	for (unsigned t = 0; t < 1000 && rd(rmb + RMB_PBL_STATUS) == 0; t++) {
++		delay_for_interval(1, NSEC_PER_MSEC);
++	}
++	value = rd(rmb + RMB_PBL_STATUS);
++	say("eqmss: mss: PBL_STATUS %#x (1 is success)\n", value);
++	if (value != 1) {
++		goto out;
++	}
++	for (unsigned t = 0; t < 5000 && (value = rd(rmb + RMB_MBA_STATUS)) == 0; t++) {
++		delay_for_interval(1, NSEC_PER_MSEC);
++	}
++	say("eqmss: mss: MBA_STATUS %d (1 or 2: XPU unlocked), PBL %#x, MSS_STATUS %#x\n", (int32_t)value, rd(rmb + RMB_PBL_STATUS), rd(rmb + RMB_MSS_STATUS));
++	ok = value == 1 || value == 2;
++	if (ok) {
++		say("eqmss: mss: THE MBA RUNS ON THE MODEM'S Q6 AND SAYS IT UNLOCKED THE XPU\n");
++		delay_for_interval(1000, NSEC_PER_MSEC);
++		say("eqmss: a second later MBA_STATUS %d, PBL %#x\n", (int32_t)rd(rmb + RMB_MBA_STATUS), rd(rmb + RMB_PBL_STATUS));
++	}
++out:
++	announce(5, "(W2e) takes it all back as Linux q6v5_mba_reclaim does: halt the AXI ports, reset, clocks, memory, rails, QMP");
++	if (released) {
++		announce(5, "(W2e) back 1: halts the q6 AXI port (after half a second for the modem to settle after its stop-ack)");
++		delay_for_interval(500, NSEC_PER_MSEC);
++		halted &= halt_port("q6", tcsr + 0x3000);
++		announce(5, "(W2e) back 2: halts the modem AXI port");
++		halted &= halt_port("modem", tcsr + 0x5000);
++		announce(5, "(W2e) back 3: halts the nc AXI port");
++		halted &= halt_port("nc", tcsr + 0x4000);
++		announce(5, "(W2e) back 4: puts the modem into reset");
++		mss_reset_assert(pdc, restart);
++	}
++	announce(5, "(W2e) back 5: turns the clocks off");
++	mss_clocks_off(1, 3, turned);
++	mss_clocks_off(3, MSS_CLOCKS, turned);
++	mss_clocks_off(0, 1, turned);
++	if (!halted) {
++		say("eqmss: mss: A PORT DID NOT HALT: the memory is NOT given back (TrustZone took the phone down with it, EXP-0198); reset the phone before the next run\n");
++		return;
++	}
++	announce(5, "(W2e) back 6: gives the MBA and modem memory back to the kernel");
++	if (mba_owners != (1ull << VMID_HLOS)) {
++		assign_mem("mba", MBA_MEMORY, MBA_SIZE, &mba_owners, true, false);
++	}
++	if (mpss_owners != (1ull << VMID_HLOS)) {
++		assign_mem("mpss", MPSS_MEMORY, MPSS_SIZE, &mpss_owners, true, false);
++	}
++	announce(5, "(W2e) back 7: rails and QMP");
++	gcc_show();
++	if (qmp) {
++		rpmh_level_pos("mss.lvl", 0);
++		rail_position("mss.lvl", 0, &address, false);
++	}
++	qmp_send("{class: image, res: load_state, name: modem, val: off}");
++	if (mba_owners != (1ull << VMID_HLOS) || mpss_owners != (1ull << VMID_HLOS)) {
++		say("eqmss: mss: A REGION IS STILL THE MODEM'S: DO NOT TOUCH IT (mba %#llx, mpss %#llx)\n", mba_owners, mpss_owners);
++	}
++	say("eqmss: mss: W2%c done: %s\n", 'e', ok ? "the MBA ran and cleanup was attempted" : "A STEP FAILED; inspect cleanup messages");
++}
++
++/* Called on the existing delayed WLAN thread, once, only for equuleus. */
++void
++equuleus_mss_probe(void)
++{
++    unsigned mode = 0;
++    static bool entered;
++    if (!sweet_board_is("xiaomi,equuleus") || entered ||
++        !PE_parse_boot_argn("sweetmss", &mode, sizeof(mode)) || mode == 0) {
++        return;
++    }
++    if (mode != 1 && mode != 2 && mode != 5) {
++        say("eqmss: supported sweetmss modes: 1 survey, 2 rails/clocks, 5 MBA only\n");
++        return;
++    }
++    entered = true;
++    say("eqmss: port 0149, mode %u; no modem image or Wi-Fi driver\n", mode);
++    mss_w2a();
++    if (mode == 2) {
++        mss_w2bc(2);
++    } else if (mode == 5) {
++        mss_run_mba();
++    }
++    say("eqmss: test finished; reboot fully before another hardware test\n");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
