@@ -1,0 +1,113 @@
+--- a/bsd/dev/equuleus_mss.c
++++ b/bsd/dev/equuleus_mss.c
+@@ -1004,23 +1004,62 @@
+ #define Q6SS_CBCR_CLKEN         (1u << 0)
+ #define Q6SS_CBCR_CLKOFF        (1u << 31)
+ 
+-/* Linux q6v5proc_halt_axi_port (it waits 100 ms for the ack; here 1 s, EXP-0198); true if the port is idle afterwards. */
++/* 0151: read-only snapshots of already used register windows. No ownership change. */
++void
++equuleus_mss_stop_snapshot(const char *phase)
++{
++	static const uint32_t offsets[] = { 0x3000, 0x5000, 0x4000 };
++	static const char *const names[] = { "q6", "modem", "nc" };
++	vm_offset_t tcsr = ml_io_map(TCSR_HALT_PHYS, 0x10000);
++	vm_offset_t rmb = ml_io_map(RMB_PHYS, 0x1000);
++	vm_offset_t pdc = ml_io_map(PDC_PHYS, 0x1000);
++	vm_offset_t restart = ml_io_map(AOSS_CC_PHYS, 0x1000);
++
++	say("eqmss: stop snapshot %s\n", phase);
++	gcc_show();
++	if (tcsr) {
++		for (unsigned i = 0; i < 3; i++) {
++			vm_offset_t port = tcsr + offsets[i];
++			say("eqmss: stop %s %s req %#x ack %#x idle %#x\n", phase,
++			    names[i], rd(port), rd(port + 4), rd(port + 8));
++		}
++	}
++	if (rmb && pdc && restart && strcmp(phase, "after-reset") != 0) {
++		say("eqmss: stop %s MBA %d MSS %#x ALT_RESET %#x PDC %#x RESTART %#x\n",
++		    phase, (int32_t)rd(rmb + RMB_MBA_STATUS), rd(rmb + RMB_MSS_STATUS),
++		    rd(rmb + RMB_ALT_RESET), rd(pdc + PDC_SYNC_RESET), rd(restart));
++	}
++	if (restart) { ml_io_unmap(restart, 0x1000); }
++	if (pdc) { ml_io_unmap(pdc, 0x1000); }
++	if (rmb) { ml_io_unmap(rmb, 0x1000); }
++	if (tcsr) { ml_io_unmap(tcsr, 0x10000); }
++}
++
++/* Linux samples IDLE before clearing HALTREQ. A late post-clear change is not proof of halt. */
+ static bool
+ halt_port(const char *name, vm_offset_t port)
+ {
+-	uint32_t ack = 0, waited = 0;
++	uint32_t ack = 0, waited = 0, request, idle;
+ 
+ 	if (rd(port + 8)) {
+ 		say("eqmss: mss: halt port %s is idle already\n", name);
+ 		return true;
+ 	}
+ 	wr(port, 1);
++	settle();
++	request = rd(port);
+ 	for (; waited < 1000 && !(ack = rd(port + 4)); waited++) {
+ 		delay_for_interval(1, NSEC_PER_MSEC);
+ 	}
+-	say("eqmss: mss: halt port %s: ack %#x after %u ms, idle %#x\n", name, ack, waited, rd(port + 8));
++	idle = rd(port + 8);
++	say("eqmss: mss: halt port %s: request readback %#x ack %#x after %u ms, held idle %#x\n",
++	    name, request, ack, waited, idle);
+ 	wr(port, 0);
+-	return rd(port + 8) != 0;
++	settle();
++	say("eqmss: mss: halt port %s: released req %#x ack %#x idle %#x\n",
++	    name, rd(port), rd(port + 4), rd(port + 8));
++	/* Like Linux, IDLE is authoritative; reject an unlatched request on this explicit request path. */
++	return request == 1 && idle != 0;
+ }
+ 
+ /* 0150 MPSS and SMP2P, adapted from the pinned dipper source; APSL-2.0. */
+@@ -1543,6 +1582,7 @@
+ 		return false;
+ 	}
+ 	state = dsp_state(&theirs);
++	equuleus_mss_stop_snapshot("before-stop");
+ 	if (!(state & DSP_READY) || (state & DSP_FATAL)) {
+ 		say("eqmss: the DSP is not asked to stop first: its entry says %#x, not \"up\"\n", state);
+ 		return false;
+@@ -1566,6 +1606,7 @@
+ 	smem_poke(value_at, ours.entry[entry].value & ~DSP_STOP);
+ 	settle();
+ 	ring(rem.doorbell);
++	equuleus_mss_stop_snapshot("after-stop");
+ 	return (state & DSP_STOP_ACK) != 0;
+ }
+ 
+@@ -2081,6 +2122,7 @@
+ out:
+ 	announce(5, "(W2e) takes it all back as Linux q6v5_mba_reclaim does: halt the AXI ports, reset, clocks, memory, rails, QMP");
+ 	if (released) {
++		equuleus_mss_stop_snapshot("before-halt");
+ 		announce(5, "(W2e) back 1: halts the q6 AXI port (after half a second for the modem to settle after its stop-ack)");
+ 		delay_for_interval(500, NSEC_PER_MSEC);
+ 		halted &= halt_port("q6", tcsr + 0x3000);
+@@ -2088,8 +2130,10 @@
+ 		halted &= halt_port("modem", tcsr + 0x5000);
+ 		announce(5, "(W2e) back 3: halts the nc AXI port");
+ 		halted &= halt_port("nc", tcsr + 0x4000);
++		equuleus_mss_stop_snapshot("after-halt");
+ 		announce(5, "(W2e) back 4: puts the modem into reset");
+ 		mss_reset_assert(pdc, restart);
++		equuleus_mss_stop_snapshot("after-reset");
+ 	}
+ 	announce(5, "(W2e) back 5: turns the clocks off");
+ 	mss_clocks_off(1, 3, turned);
+@@ -2134,7 +2178,7 @@
+         return;
+     }
+     entered = true;
+-    say("eqmss: port 0150, mode %u; no Wi-Fi driver or GLINK host services\n", mode);
++    say("eqmss: port 0151, mode %u; no Wi-Fi driver or GLINK host services\n", mode);
+     mss_w2a();
+     if (mode == 2) {
+         mss_w2bc(2);
