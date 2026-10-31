@@ -74,6 +74,7 @@ int main(void) {
 #include <stdarg.h>
 #include <string.h>
 typedef uintptr_t vm_offset_t;
+#define PAGE_SIZE 16384u
 #define TCSR_HALT_PHYS 0x01f60000ul
 #define RMB_PHYS 0x04000000ul
 #define PDC_PHYS 0x0b200000ul
@@ -85,8 +86,8 @@ typedef uintptr_t vm_offset_t;
 static unsigned maps,unmaps,rmb_reads,clock_reads,fail_map;
 static void say(const char *s,...) {(void)s;}
 static void gcc_show(void) {clock_reads++;}
-static vm_offset_t ml_io_map(uintptr_t p,unsigned n) {(void)n;maps++;return maps==fail_map?0:p;}
-static void ml_io_unmap(vm_offset_t p,unsigned n) {assert(p && n);unmaps++;}
+static vm_offset_t ml_io_map(uintptr_t p,unsigned n) {assert(n && n%PAGE_SIZE==0 && p%PAGE_SIZE==0);maps++;return maps==fail_map?0:p;}
+static void ml_io_unmap(vm_offset_t p,unsigned n) {assert(p && n && n%PAGE_SIZE==0 && p%PAGE_SIZE==0);unmaps++;}
 static uint32_t rd(vm_offset_t a) {if(a>=RMB_PHYS && a<RMB_PHYS+4096)rmb_reads++;return 0;}
 '''
     snap_main=r'''
