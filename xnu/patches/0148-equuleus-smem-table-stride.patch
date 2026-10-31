@@ -1,0 +1,7 @@
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -1,3 +1,3 @@
+ for (uint32_t i = 0; i < n; i++) {
+-uint32_t e = top + 32 + i * 32;
++uint32_t e = top + 32 + i * 48;
+ uint32_t offset = smem_u32(e), size = smem_u32(e + 4), hosts = smem_u32(e + 12);
