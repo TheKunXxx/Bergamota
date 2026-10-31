@@ -1,0 +1,1045 @@
+diff --git a/bsd/dev/equuleus_mss.c b/bsd/dev/equuleus_mss.c
+index f4cd68e..8c24e6d 100644
+--- a/bsd/dev/equuleus_mss.c
++++ b/bsd/dev/equuleus_mss.c
+@@ -6,6 +6,7 @@
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <kern/clock.h>
++#include <kern/thread.h>
+ #include <kern/kalloc.h>
+ #include <libkern/libkern.h>
+ #include <mach/mach_types.h>
+@@ -1022,6 +1023,932 @@ halt_port(const char *name, vm_offset_t port)
+ 	return rd(port + 8) != 0;
+ }
+ 
++/* 0150 MPSS and SMP2P, adapted from the pinned dipper source; APSL-2.0. */
++#define SMEM_PHYS               0x86000000UL
++#define SMEM_SIZE               0x00200000u
++#define SMEM_US                 0
++#define SMEM_MODEM              1               /* dt: qcom,remote-pid of qcom,smp2p-modem and qcom,glink-smem-native-xprt-modem */
++#define SMEM_ADSP               2
++#define SMEM_DSPS               3
++#define SMEM_CDSP               5
++#define SMEM_GLOBAL             0xfffe
++#define SMEM_CANARY             0xa5a5
++#define SMEM_VERSION_WORD       (0x40 + 4 * 7)  /* of the old header at the start: the boot loader's word, [31:16]; 12 = partitions */
++
++struct smem_table_entry {
++	uint32_t offset, size, flags;
++	uint16_t host0, host1;
++	uint32_t cacheline, reserved[7];
++};
++struct smem_table {
++	uint8_t magic[4];
++	uint32_t version, count, reserved[5];
++};
++struct smem_partition {
++	uint8_t magic[4];
++	uint16_t host0, host1;
++	uint32_t size, free_uncached, free_cached, reserved[3];
++};
++struct smem_entry {
++	uint16_t canary, item;
++	uint32_t size;
++	uint16_t padding_data, padding_header;
++	uint32_t reserved;
++};
++struct smem_item {
++	uint32_t item, offset, size;
++};
++
++/*
++ * Items worth looking for (Linux: SMP2P, GLINK, SMEM users; dt: qcom,smem of qcom,smp2p-*). The modem's SMP2P pair is
++ * <427 428> on the sdm845's dt of Android; Linux's sdm845.dtsi has <443 429> for every remote, each in its own partition.
++ * GLINK's descriptor and FIFO are items 478 and 479 of the partition of the two hosts.
++ */
++#define ITEM_SMP2P_THEIRS       443
++#define ITEM_SMP2P_OURS         429
++#define ITEM_SMP2P_THEIRS_ALT   435             /* the modem's: Linux sdm845.dtsi qcom,smem = <435>, <428> for mpss */
++#define ITEM_SMP2P_OURS_ALT     428
++#define ITEM_GLINK_DESCRIPTOR   478
++#define ITEM_GLINK_FIFO         479
++#define ITEM_CRASH_REASON       421             /* 421 + remote pid: the reason a remote processor gave when it died */
++
++static const volatile uint8_t *smem;
++
++static bool
++smem_peek(uint64_t offset, void *to, uint32_t size)
++{
++	if (smem == NULL) {
++		smem = (const volatile uint8_t *)io_map(SMEM_PHYS, SMEM_SIZE, VM_WIMG_WCOMB, VM_PROT_READ | VM_PROT_WRITE, true);
++	}
++	if (smem == NULL || offset > SMEM_SIZE || size > SMEM_SIZE - offset) {
++		return false;
++	}
++	for (uint32_t i = 0; i < size; i++) {
++		((uint8_t *)to)[i] = smem[offset + i];
++	}
++	return true;
++}
++
++static uint32_t
++smem_word(uint32_t offset)
++{
++	uint32_t value = 0;
++
++	smem_peek(offset, &value, sizeof(value));
++	return value;
++}
++
++static bool
++smem_table(struct smem_table *table)
++{
++	return smem_peek(SMEM_SIZE - 0x1000, table, sizeof(*table)) && memcmp(table->magic, "$TOC", 4) == 0 && table->version == 1 &&
++	       table->count <= 64;
++}
++
++/* The partition of two hosts: where it is (0: none), how big, and its cache line. */
++static uint32_t
++smem_partition(uint16_t one, uint16_t other, uint32_t *cacheline, uint32_t *size)
++{
++	struct smem_table table;
++	struct smem_table_entry entry;
++	struct smem_partition header;
++
++	if (!smem_table(&table)) {
++		return 0;
++	}
++	for (uint32_t i = 0; i < table.count; i++) {
++		if (!smem_peek(SMEM_SIZE - 0x1000 + sizeof(table) + i * sizeof(entry), &entry, sizeof(entry)) || entry.offset == 0 ||
++		    entry.size == 0) {
++			continue;
++		}
++		if (!((entry.host0 == one && entry.host1 == other) || (entry.host0 == other && entry.host1 == one))) {
++			continue;
++		}
++		if ((uint64_t)entry.offset + entry.size > SMEM_SIZE - 0x1000 || !smem_peek(entry.offset, &header, sizeof(header)) ||
++		    memcmp(header.magic, "$PRT", 4) != 0 || header.size != entry.size) {
++			return 0;
++		}
++		*cacheline = entry.cacheline;
++		*size = entry.size;
++		return entry.offset;
++	}
++	return 0;
++}
++
++static unsigned
++smem_items(uint32_t partition, uint32_t cacheline, struct smem_item *found, unsigned max)
++{
++	struct smem_partition header;
++	struct smem_entry entry;
++	uint32_t at, step_back;
++	unsigned count = 0;
++
++	if (partition == 0 || !smem_peek(partition, &header, sizeof(header)) || header.free_uncached < sizeof(header) || header.free_uncached > header.free_cached || header.free_uncached > header.size ||
++	    header.free_cached > header.size) {
++		return 0;
++	}
++	for (at = sizeof(header); at + sizeof(entry) <= header.free_uncached;) {
++		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.size > header.size || entry.padding_data > entry.size ||
++            (uint64_t)at + sizeof(entry) + entry.padding_header + entry.size > header.free_uncached) {
++			break;
++		}
++		if (count < max) {
++			found[count].item = entry.item;
++			found[count].offset = partition + at + sizeof(entry) + entry.padding_header;
++			found[count].size = entry.size - entry.padding_data;
++		}
++		count++;
++		at += sizeof(entry) + entry.padding_header + entry.size;
++	}
++	if (cacheline == 0 || cacheline > 4096 || (cacheline & (cacheline - 1))) {
++		return count;
++	}
++	step_back = ((uint32_t)sizeof(entry) + cacheline - 1) & ~(cacheline - 1);
++	for (at = header.size - step_back; at > header.free_cached && at < header.size;) {
++		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.size > at || entry.padding_data > entry.size || at - entry.size < header.free_cached) {
++			break;
++		}
++		if (count < max) {
++			found[count].item = entry.item;
++			found[count].offset = partition + at - entry.size;
++			found[count].size = entry.size - entry.padding_data;
++		}
++		count++;
++		if (entry.size + step_back > at) {
++			break;
++		}
++		at -= entry.size + step_back;
++	}
++	return count;
++}
++
++#define MAX_ITEMS 192
++
++static struct smem_item found[MAX_ITEMS];
++
++static const char *
++host_name(uint16_t host)
++{
++	switch (host) {
++	case 0: return "apps";
++	case 1: return "modem";
++	case 2: return "adsp";
++	case 3: return "dsps";
++	case 4: return "wcnss";
++	case 5: return "cdsp";
++	case SMEM_GLOBAL: return "global";
++	default: return "?";
++	}
++}
++
++static const struct smem_item *
++find_item(unsigned count, uint32_t item)
++{
++	for (unsigned i = 0; i < count && i < MAX_ITEMS; i++) {
++		if (found[i].item == item) {
++			return &found[i];
++		}
++	}
++	return NULL;
++}
++
++static void
++show_smp2p(const char *who, uint32_t offset, uint32_t size)
++{
++	uint32_t magic = smem_word(offset), version = smem_word(offset + 4), pids = smem_word(offset + 8);
++	uint32_t counts = smem_word(offset + 12), flags = smem_word(offset + 16);
++	char line[320];
++	int at = 0;
++
++	say("eqmss: 1:   smp2p %s at %#lx (%u bytes): magic %#x version %u pids %#x counts %#x flags %#x\n", who, SMEM_PHYS + offset, size,
++	    magic, version, pids, counts, flags);
++	if (magic != 0x504d5324) {
++		return;
++	}
++	for (uint32_t i = 0; i < (counts >> 16) && i < 16; i++) {
++		uint8_t name[17];
++
++		smem_peek(offset + 20 + 20 * i, name, 16);
++		name[16] = 0;
++		at += snprintf(line + at, sizeof(line) - (size_t)at, " %s=%#x", name, smem_word(offset + 36 + 20 * i));
++	}
++	say("eqmss: 1:     entries:%s\n", line);
++}
++
++#define MUTEX_PHYS              0x01f40000ul    /* dt: qcom,ipc-spinlock-sfpb@1f40000, 8 locks (Linux: syscon, stride 0x1000) */
++#define MUTEX_SIZE              0x8000u
++#define MUTEX_SMEM              3               /* Linux sdm845.dtsi: smem hwlocks = <&tcsr_mutex 3> */
++#define MUTEX_STRIDE            0x1000u
++#define LOCK_US                 1u              /* the application processor's number (qcom_hwspinlock.c) */
++
++static vm_offset_t mutex_base;
++
++static vm_offset_t
++mutex_map(void)
++{
++	if (mutex_base == 0) {
++		mutex_base = ml_io_map(MUTEX_PHYS, MUTEX_SIZE);
++	}
++	return mutex_base;
++}
++
++static bool
++lock_take(void)
++{
++	vm_offset_t lock = mutex_map() + MUTEX_SMEM * MUTEX_STRIDE;
++	uint32_t owner = ~0u;
++
++	for (uint32_t ms = 0; ms <= 1000; ms++) {
++		wr(lock, LOCK_US);
++		owner = rd(lock);
++		if (owner == LOCK_US) {
++			return true;
++		}
++		delay_for_interval(1, NSEC_PER_MSEC);
++	}
++	say("eqmss: SMEM's lock is held by processor %u for a second: nothing is written\n", owner);
++	return false;
++}
++
++static void
++lock_give(void)
++{
++	wr(mutex_map() + MUTEX_SMEM * MUTEX_STRIDE, 0);
++}
++
++struct smp2p {
++	uint32_t magic;
++	uint32_t version;
++	uint16_t local, remote, total, valid;
++	uint32_t flags;
++	struct {
++		char name[16];
++		uint32_t value;
++	} entry[16];
++};
++#define SMP2P_MAGIC             0x504d5324
++#define SMP2P_VERSION           1
++#define SMP2P_RESTART_ACKS      1u
++#define SMP2P_AT_VERSION        4
++#define SMP2P_AT_PROCESSORS     8
++#define SMP2P_AT_COUNTS         12
++#define SMP2P_AT_NAME(i)        (20 + 20 * (i))
++
++static void
++smem_poke(uint32_t offset, uint32_t value)
++{
++	if (smem && !(offset & 3) && offset <= SMEM_SIZE - 4) { wr((vm_offset_t)smem + offset, value); }
++}
++
++/* Where an item is in a partition (0: not there). */
++static uint32_t
++item_find(uint32_t partition, uint32_t cacheline, uint32_t item, uint32_t *size)
++{
++	unsigned count = smem_items(partition, cacheline, found, MAX_ITEMS);
++	const struct smem_item *it = find_item(count, item);
++
++	if (it == NULL) {
++		return 0;
++	}
++	*size = it->size;
++	return it->offset;
++}
++
++/* Linux's qcom_smem_alloc_private() for an item at the bottom of the partition; the lock is ours when this is called. */
++static bool
++item_make_locked(uint32_t partition, uint32_t item, uint32_t item_size)
++{
++	struct smem_partition header;
++	struct smem_entry entry;
++	if (!item_size || (item_size & 7) || item_size > 16384) { return false; }
++	const uint32_t need = sizeof(entry) + item_size;
++	uint32_t at;
++
++	if (!smem_peek(partition, &header, sizeof(header)) || header.free_uncached > header.free_cached || header.free_cached > header.size) {
++		say("eqmss: the partition's marks make no sense: nothing is written\n");
++		return false;
++	}
++	for (at = sizeof(header); at < header.free_uncached;) {
++		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.item == item || entry.size > header.size || entry.padding_data > entry.size ||
++            (uint64_t)at + sizeof(entry) + entry.padding_header + entry.size > header.free_uncached) {
++			break;
++		}
++		at += sizeof(entry) + entry.padding_header + entry.size;
++	}
++	if (at != header.free_uncached) {
++		say("eqmss: the partition's entries do not end at its mark (+%#x, the mark is +%#x), or item %u has appeared: nothing is written\n", at,
++		    header.free_uncached, item);
++		return false;
++	}
++	if ((uint64_t)at + need > header.free_cached) {
++		say("eqmss: no room for item %u: %u wanted, %u free: nothing is written\n", item, need, header.free_cached - at);
++		return false;
++	}
++	/* the entry first, whole; only then the mark, in one store: nobody sees half of either */
++	smem_poke(partition + at, SMEM_CANARY | item << 16);
++	smem_poke(partition + at + 4, item_size);
++	smem_poke(partition + at + 8, 0);               /* no padding either side: item_size is a multiple of 8 */
++	smem_poke(partition + at + 12, 0);
++	settle();
++	smem_poke(partition + __offsetof(struct smem_partition, free_uncached), at + need);
++	settle();
++	return true;
++}
++
++static void
++smp2p_fill(uint32_t at, uint16_t remote, const char *const *names, unsigned count)
++{
++	for (uint32_t off = 0; off < sizeof(struct smp2p); off += 4) {
++		smem_poke(at + off, 0);
++	}
++	settle();
++	smem_poke(at, SMP2P_MAGIC);
++	smem_poke(at + SMP2P_AT_PROCESSORS, SMEM_US | (uint32_t)remote << 16);
++	for (unsigned i = 0; i < count; i++) {
++		uint32_t name[4] = { 0 };
++
++		strlcpy((char *)name, names[i], sizeof(name));
++		for (uint32_t w = 0; w < 4; w++) {
++			smem_poke(at + SMP2P_AT_NAME(i) + 4 * w, name[w]);
++		}
++	}
++	smem_poke(at + SMP2P_AT_COUNTS, 16 | count << 16);
++	smem_poke(at + SMP2P_AT_VERSION, SMP2P_RESTART_ACKS << 8);
++	settle();
++	smem_poke(at + SMP2P_AT_VERSION, SMP2P_RESTART_ACKS << 8 | SMP2P_VERSION);     /* last: makes it valid */
++	settle();
++}
++
++static void
++make_our_item(uint16_t remote, uint32_t item, const char *const *names, unsigned count)
++{
++	uint32_t cacheline = 0, size = 0, partition = smem_partition(SMEM_US, remote, &cacheline, &size), at, item_size = 0;
++	const uint32_t want = (sizeof(struct smp2p) + 7) & ~7u;
++
++	if (partition == 0) {
++		say("eqmss: 4: no partition with %s\n", host_name(remote));
++		return;
++	}
++	at = item_find(partition, cacheline, item, &item_size);
++	if (at != 0) {
++		say("eqmss: 4: item %u is already there with %s at %#lx (%u bytes): left alone\n", item, host_name(remote), SMEM_PHYS + at, item_size);
++		return;
++	}
++	if (!lock_take()) {
++		return;
++	}
++	if (item_make_locked(partition, item, want)) {
++		lock_give();
++		at = item_find(partition, cacheline, item, &item_size);
++		if (at == 0) {
++			say("eqmss: 4: ITEM %u IS NOT FOUND where it was just made\n", item);
++			return;
++		}
++		smp2p_fill(at, remote, names, count);
++		say("eqmss: 4: item %u made with %s at %#lx (%u bytes) and filled in (%u entries, valid)\n", item, host_name(remote), SMEM_PHYS + at,
++		    item_size, count);
++		show_smp2p("ours, as written", at, item_size);
++	} else {
++		lock_give();
++	}
++}
++
++static uint32_t our_item;
++/* Which remote processor the SMP2P helpers below talk to: the audio DSP unless W2f points them at the modem. */
++static struct {
++	uint16_t remote;
++	uint32_t theirs_item, doorbell;
++} rem = { SMEM_ADSP, ITEM_SMP2P_THEIRS, IPC_SMP2P_ADSP };
++static bool smp2p_agreed, smp2p_restart_acks, smp2p_restart_acked;
++#define SMP2P_AT_FLAGS          16
++#define SMP2P_AT_VALUE(i)       (36 + 20 * (i))
++#define SMP2P_RESTART_DONE      (1u << 0)
++#define SMP2P_RESTART_ACK       (1u << 1)
++#define DSP_FATAL               (1u << 0)
++#define DSP_READY               (1u << 1)
++#define DSP_HANDOVER            (1u << 2)
++#define DSP_STOP_ACK            (1u << 3)
++#define DSP_SHUTDOWN_ACK        (1u << 7)
++#define DSP_STOP                (1u << 0)
++
++static uint32_t
++adsp_item(uint32_t item, uint32_t *size)
++{
++	uint32_t cacheline = 0, psize = 0, partition = smem_partition(SMEM_US, rem.remote, &cacheline, &psize);
++
++	return partition ? item_find(partition, cacheline, item, size) : 0;
++}
++
++static bool
++dsp_words(struct smp2p *words)
++{
++	uint32_t size = 0, at = adsp_item(rem.theirs_item, &size);
++
++	if (at == 0 || size < sizeof(*words)) {
++		return false;
++	}
++	return smem_peek(at, words, sizeof(*words)) && words->magic == SMP2P_MAGIC &&
++        words->local == SMEM_MODEM && words->remote == SMEM_US && words->valid <= words->total && words->total <= 16;
++}
++
++static int
++smp2p_entry(const struct smp2p *words, const char *name)
++{
++	for (unsigned i = 0; i < words->valid && i < 16; i++) {
++		if (strncmp(words->entry[i].name, name, sizeof(words->entry[i].name)) == 0) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++static uint32_t
++dsp_state(const struct smp2p *words)
++{
++	int entry = smp2p_entry(words, "slave-kernel");
++
++	return entry < 0 ? 0 : words->entry[entry].value;
++}
++
++static void
++show_words(const char *prefix, const struct smp2p *words)
++{
++	char line[320];
++	int at = 0;
++
++	line[0] = 0;
++	for (unsigned i = 0; i < words->valid && i < 16 && at < (int)sizeof(line) - 40; i++) {
++		at += snprintf(line + at, sizeof(line) - (size_t)at, " %.16s = %#x;", words->entry[i].name, words->entry[i].value);
++	}
++	say("eqmss: %s: SMP2P version %u, features %#x, processors %u->%u, flags %#x, %u of %u entries:%s\n", prefix, words->version & 0xff,
++	    words->version >> 8, words->local, words->remote, words->flags, words->valid, words->total, line);
++}
++
++/* What Linux does when the DSP rings for SMP2P: agree on the features once, and answer a restart. */
++static void
++dsp_listen(const struct smp2p *theirs)
++{
++	struct smp2p ours;
++
++	if (our_item == 0 || !smem_peek(our_item, &ours, sizeof(ours)) || ours.magic != SMP2P_MAGIC) {
++		return;
++	}
++	if (!smp2p_agreed) {
++		uint32_t features = (ours.version >> 8) & (theirs->version >> 8);
++
++		if ((theirs->version & 0xff) != (ours.version & 0xff)) {
++			return;
++		}
++		if (features != ours.version >> 8) {
++			smem_poke(our_item + SMP2P_AT_VERSION, features << 8 | (ours.version & 0xff));
++		}
++		smp2p_restart_acks = features & SMP2P_RESTART_ACKS;
++		smp2p_agreed = true;
++		say("eqmss: 8: the DSP and we agree on SMP2P: version %u, features %#x\n", ours.version & 0xff, features);
++	}
++	if (smp2p_restart_acks && ((theirs->flags & SMP2P_RESTART_DONE) != 0) != smp2p_restart_acked) {
++		smp2p_restart_acked = !smp2p_restart_acked;
++		say("eqmss: 8: the DSP's flags say it has restarted (%#x): answered in our flags (bit 1 = %u), and its doorbell\n", theirs->flags,
++		    smp2p_restart_acked);
++		smem_poke(our_item + SMP2P_AT_FLAGS, (ours.flags & ~SMP2P_RESTART_ACK) | (smp2p_restart_acked ? SMP2P_RESTART_ACK : 0));
++		settle();
++		ring(rem.doorbell);
++	}
++}
++
++static uint64_t
++now_us(void)
++{
++	uint64_t nanoseconds;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &nanoseconds);
++	return nanoseconds / 1000;
++}
++
++/* Linux's qcom_q6v5_request_stop(): our bit "stop", the DSP's "stop ack" waited for, our bit taken back. */
++static bool
++dsp_ask_to_stop(uint32_t bound_ms)
++{
++	struct smp2p ours, theirs;
++	uint32_t state, value_at;
++	uint64_t asked, now;
++	int entry;
++
++	if (our_item == 0 || !smem_peek(our_item, &ours, sizeof(ours)) || ours.magic != SMP2P_MAGIC || (entry = smp2p_entry(&ours, "master-kernel")) < 0) {
++		say("eqmss: the DSP is not asked to stop: there is no item of ours to ask it with\n");
++		return false;
++	}
++	if (!dsp_words(&theirs) || smp2p_entry(&theirs, "slave-kernel") < 0) {
++		say("eqmss: the DSP is not asked to stop: its item has no entry to answer in\n");
++		return false;
++	}
++	state = dsp_state(&theirs);
++	if (!(state & DSP_READY) || (state & DSP_FATAL)) {
++		say("eqmss: the DSP is not asked to stop first: its entry says %#x, not \"up\"\n", state);
++		return false;
++	}
++	value_at = our_item + SMP2P_AT_VALUE((uint32_t)entry);
++	say("eqmss: asking the DSP to stop: bit 0 of our \"master-kernel\" at %#lx, and its doorbell\n", SMEM_PHYS + value_at);
++	smem_poke(value_at, ours.entry[entry].value | DSP_STOP);
++	settle();
++	ring(rem.doorbell);
++	asked = now = now_us();
++	while (now - asked < bound_ms * 1000ull) {
++		if (dsp_words(&theirs) && (dsp_state(&theirs) & (DSP_STOP_ACK | DSP_FATAL))) {
++			break;
++		}
++		delay_for_interval(200, NSEC_PER_USEC);
++		now = now_us();
++	}
++	state = dsp_words(&theirs) ? dsp_state(&theirs) : 0;
++	say("eqmss: %s after %llu.%03llu ms; its entry says %#x\n", state & DSP_STOP_ACK ? "THE MODEM ACKNOWLEDGES THE STOP" :
++	    "THE MODEM DOES NOT ACKNOWLEDGE THE STOP", (now - asked) / 1000, (now - asked) % 1000, state);
++	smem_poke(value_at, ours.entry[entry].value & ~DSP_STOP);
++	settle();
++	ring(rem.doorbell);
++	return (state & DSP_STOP_ACK) != 0;
++}
++
++static void
++show_crash_reason(void)
++{
++	char text[81];
++	uint32_t size = 0, at = adsp_item(ITEM_CRASH_REASON + rem.remote, &size);     /* 421 + remote pid */
++
++	if (at == 0) {
++		uint32_t cacheline = 0, psize = 0, global = smem_partition(SMEM_GLOBAL, SMEM_GLOBAL, &cacheline, &psize);
++
++		at = global ? item_find(global, cacheline, ITEM_CRASH_REASON + rem.remote, &size) : 0;
++	}
++	if (at == 0 || size == 0) {
++		say("eqmss: item %u, the DSP's last words: not there\n", ITEM_CRASH_REASON + rem.remote);
++		return;
++	}
++	memset(text, 0, sizeof(text));
++	smem_peek(at, text, size < sizeof(text) - 1 ? size : sizeof(text) - 1);
++	say("eqmss: THE MODEM'S LAST WORDS (item %u, %u bytes): \"%s\"\n", ITEM_CRASH_REASON + rem.remote, size, text);
++}
++
++static bool
++modem_prepare_smp2p(void)
++{
++	static const char *const names[] = { "master-kernel", "ipa-ap-to-modem" };
++	uint32_t cacheline = 0, psize = 0, size = 0, partition = smem_partition(SMEM_US, SMEM_MODEM, &cacheline, &psize);
++
++	rem.remote = SMEM_MODEM;
++	rem.theirs_item = ITEM_SMP2P_THEIRS_ALT;
++	rem.doorbell = IPC_SMP2P_MODEM;
++	if (partition == 0) { return false; }
++    struct smp2p old_words;
++    if (dsp_words(&old_words) && (dsp_state(&old_words) & DSP_READY)) {
++        say("eqmss: existing modem READY state; full reboot required\n"); return false;
++    }
++	our_item = item_find(partition, cacheline, ITEM_SMP2P_OURS_ALT, &size);
++	if (our_item != 0 && size < sizeof(struct smp2p)) { return false; }
++	if (our_item == 0) {
++		make_our_item(SMEM_MODEM, ITEM_SMP2P_OURS_ALT, names, 2);
++		our_item = item_find(partition, cacheline, ITEM_SMP2P_OURS_ALT, &size);
++	} else {
++		smp2p_fill(our_item, SMEM_MODEM, names, 2);
++	}
++	smp2p_agreed = smp2p_restart_acks = smp2p_restart_acked = false;
++	say("eqmss: mss: our SMP2P item for the modem (428) is %s\n", our_item ? "ready" : "NOT THERE");
++	/* Linux's qcom_glink_smem_register() allocates the GLINK descriptor (478, 32 bytes) and the first FIFO (479, 16 KB) itself;
++	 * the modem makes 480 and waits for ours (EXP-0200: without 479 it gave up after 37 s). Made before the modem starts, zeroed. */
++	{
++		static const struct { uint32_t item, size; } glink[] = { { ITEM_GLINK_DESCRIPTOR, 32 }, { ITEM_GLINK_FIFO, 16384 } };
++
++		for (unsigned i = 0; i < 2; i++) {
++			uint32_t at = item_find(partition, cacheline, glink[i].item, &size);
++
++			if (at == 0 && lock_take()) {
++				bool made = item_make_locked(partition, glink[i].item, glink[i].size);
++
++				lock_give();
++				at = made ? item_find(partition, cacheline, glink[i].item, &size) : 0;
++			}
++			if (at == 0 || size < glink[i].size) { return false; }
++			for (uint32_t off = 0; at != 0 && off + 4 <= size && off < glink[i].size; off += 4) {
++				smem_poke(at + off, 0);
++			}
++			settle();
++			say("eqmss: mss: GLINK item %u of the modem: %s (%u bytes)\n", glink[i].item, at ? "ours, zeroed" : "NOT MADE", at ? size : 0);
++		}
++	}
++	return our_item != 0;
++}
++
++static int32_t
++mba_wait(vm_offset_t rmb, int32_t want, uint32_t ms)
++{
++	int32_t status = 0;
++
++	for (uint32_t t = 0; t < ms; t++) {
++		status = (int32_t)rd(rmb + RMB_MBA_STATUS);
++		if (status < 0 || status == want) {
++			return status;
++		}
++		delay_for_interval(1, NSEC_PER_MSEC);
++	}
++	return status == want ? status : 0;
++}
++
++static bool
++put_phys(uint64_t phys, const void *from, uint32_t length)
++{
++	if (!length || phys < MPSS_MEMORY || phys - MPSS_MEMORY > MPSS_SIZE ||
++        length > MPSS_SIZE - (phys - MPSS_MEMORY)) { return false; }
++	uint64_t base = phys & ~(uint64_t)(PAGE_SIZE - 1);      /* the kernel's pages are 16 KB: a 4 KB-aligned map panics on unmap (EXP-0198) */
++	uint32_t off = (uint32_t)(phys - base), span = (off + length + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
++	vm_offset_t va = io_map((vm_offset_t)base, span, VM_WIMG_WCOMB, VM_PROT_READ | VM_PROT_WRITE, true);
++
++	if (va == 0) {
++		return false;
++	}
++	if (from) {
++		memcpy((void *)(va + off), from, length);
++	} else {
++		memset((void *)(va + off), 0, length);
++	}
++	settle();
++	ml_io_unmap(va, span);
++	return true;
++}
++
++static bool
++modem_watch(uint32_t seconds, uint32_t after_ready_ms)
++{
++	struct smp2p words, last;
++	uint64_t started = now_us(), limit = started + seconds * 1000000ull, now, ready_at = 0;
++	uint32_t changes = 0, state, beat = 0;
++	bool have = false;
++
++	bzero(&last, sizeof(last));
++	ring(rem.doorbell);
++	for (;;) {
++		now = now_us();
++		if (now >= limit) {
++			break;
++		}
++		if (ready_at != 0 && (now - ready_at) / 10000000ull >= beat + 1) {
++			uint32_t size = 0;
++
++			beat++;
++			say("eqmss: mss: +%u s after ready: \"slave-kernel\" %#x, GLINK items 478 %s, 479 %s, 480 %s\n", beat * 10, dsp_words(&words) ? dsp_state(&words) : 0,
++			    adsp_item(ITEM_GLINK_DESCRIPTOR, &size) ? "yes" : "no", adsp_item(ITEM_GLINK_FIFO, &size) ? "yes" : "no", adsp_item(480, &size) ? "yes" : "no");
++		}
++		if (dsp_words(&words) && (!have || memcmp(&words, &last, sizeof(words)) != 0)) {
++			char when[64];
++
++			snprintf(when, sizeof(when), "mss: +%llu.%03llu ms: the modem's item %s", (now - started) / 1000, (now - started) % 1000, have ? "changes" : "APPEARS");
++			if (changes++ < 40) {
++				show_words(when, &words);
++			}
++			last = words;
++			have = true;
++			dsp_listen(&words);
++			state = dsp_state(&words);
++			if ((state & DSP_READY) && ready_at == 0) {
++				ready_at = now;
++				limit = now + after_ready_ms * 1000ull;
++				say("eqmss: mss: THE MODEM SAYS IT IS UP: \"slave-kernel\" %#x, %llu.%03llu ms after the wait began\n", state, (now - started) / 1000, (now - started) % 1000);
++			}
++			if (state & DSP_FATAL) {
++				say("eqmss: mss: THE MODEM SAYS IT HAS GIVEN UP\n");
++				show_crash_reason();
++				return false;
++			}
++		}
++		delay_for_interval(200, NSEC_PER_USEC);
++	}
++	if (ready_at == 0) {
++		say("eqmss: mss: %s\n", have ? "THE MODEM RUNS BUT HAS NOT SAID \"UP\"" : "NOT A WORD FROM THE MODEM");
++		show_crash_reason();
++	}
++	return ready_at != 0;
++}
++
++#define MAX_SEGMENTS 48u
++#define MDT_RELOCATABLE (1u << 27)
++#define MDT_HASH(flags) ((((flags) >> 24) & 7) == 2)
++#define MBA_META_OFFSET 0x100000u
++#define MBA_META_AUTH_OK 3
++#define MBA_AUTH_COMPLETE 4
++#define RMB_META_DATA 0x10
++#define RMB_COMMAND 8
++#define RMB_CODE_START 0x14
++#define RMB_CODE_LENGTH 0x18
++struct elf_phdr { uint32_t type, offset, vaddr, paddr, file_size, memory_size, flags, align; };
++_Static_assert(sizeof(struct smem_table_entry) == 48, "SMEM table stride");
++_Static_assert(sizeof(struct smem_partition) == 32, "SMEM partition header");
++static uint16_t mpss_u16(const uint8_t *p) { return (uint16_t)p[0] | (uint16_t)p[1] << 8; }
++static uint32_t mpss_u32(const uint8_t *p) {
++    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++/* Validate the packed MDT before any MPSS/MBA write or ownership transfer.
++ * The loader uses the standard Qualcomm ELF32 program-header layout at +52.
++ */
++static bool
++mpss_validate(const uint8_t *mdt, uint32_t size, bool check_files)
++{
++    if (size < 52 || size > PAGE_SIZE || memcmp(mdt, "\177ELF", 4) ||
++        mdt[4] != 1 || mdt[5] != 1 || mdt[6] != 1 || mpss_u32(mdt + 20) != 1 ||
++        mpss_u32(mdt + 28) != 52 || mpss_u16(mdt + 40) != 52 || mpss_u16(mdt + 42) != 32) { return false; }
++    uint32_t count = mpss_u16(mdt + 44), header = 0, hashes = 0, hash_size = 0, segments = 0, lowest = ~0u;
++    bool relocate = false;
++    uint64_t total = 0;
++    if (!count || count > MAX_SEGMENTS || (uint64_t)52 + count * 32 > size) { return false; }
++    for (uint32_t i = 0; i < count; i++) {
++        struct elf_phdr ph;
++        memcpy(&ph, mdt + 52 + i * 32, sizeof(ph));
++        if (i == 0) {
++            if (ph.type != 0 || ph.file_size < 52 + count * 32 || ph.file_size > size) { return false; }
++            header = ph.file_size;
++        }
++        if (MDT_HASH(ph.flags)) {
++            if (++hashes != 1 || !ph.file_size) { return false; }
++            hash_size = ph.file_size;
++            continue;
++        }
++        if (ph.type != 1 || !ph.memory_size) { continue; }
++        if (ph.file_size > ph.memory_size || (uint64_t)ph.paddr + ph.memory_size > 0x100000000ull) { return false; }
++        total += ph.memory_size;
++        if (total > MPSS_SIZE) { return false; }
++        lowest = MIN(lowest, ph.paddr);
++        relocate |= (ph.flags & MDT_RELOCATABLE) != 0;
++        segments++;
++        if (check_files && ph.file_size) {
++            struct fs_file f;
++            char name[40];
++            snprintf(name, sizeof(name), "image/modem.b%02u", i);
++            if (!fs_lookup(name, &f) || f.dir || f.size != ph.file_size) {
++                say("eqmss: preflight: %s missing or wrong size\n", name); return false;
++            }
++        }
++    }
++    if (!segments || hashes != 1 || (uint64_t)header + hash_size != size) { return false; }
++    uint32_t origin = relocate ? lowest : MPSS_MEMORY;
++    for (uint32_t i = 0; i < count; i++) {
++        struct elf_phdr ph;
++        memcpy(&ph, mdt + 52 + i * 32, sizeof(ph));
++        if (ph.type != 1 || !ph.memory_size || MDT_HASH(ph.flags)) { continue; }
++        if (ph.paddr < origin || (uint64_t)ph.paddr - origin + ph.memory_size > MPSS_SIZE) { return false; }
++    }
++    return true;
++}
++bool equuleus_mpss_load(vm_offset_t, uint64_t *);
++bool
++equuleus_mpss_load(vm_offset_t rmb, uint64_t *mpss_owners)
++{
++	struct {
++		uint32_t paddr, file_size, memory_size, index;
++	} seg[MAX_SEGMENTS];
++	unsigned segments = 0;
++	uint8_t *mdt, *chunk = NULL;
++	uint32_t mdt_size = 0, count, ehdr_size = 0, hash_size = 0, lowest = ~0u, wait_seconds = 10, used = 0, hold = 0;
++	uint64_t loaded = 0;
++	bool relocate = false, ok = false;
++	const uint32_t chunk_size = 256 * 1024;
++	int32_t status;
++	uint32_t mpss_reloc, boot_addr;
++	uint64_t started;
++
++	wait_seconds = 15;
++	hold = 0;
++	announce(6, "(W2f) modem.mdt: the header and hashes go to the MBA, which authenticates them");
++	mdt = fs_slurp("image/modem.mdt", &mdt_size);
++	if (mdt == NULL || !mpss_validate(mdt, mdt_size, true)) {
++		say("eqmss: mss: modem.mdt preflight failed\n");
++		if (mdt) { kfree_data(mdt, mdt_size); }
++		return false;
++	}
++	count = mdt[44] | mdt[45] << 8;
++	for (uint32_t i = 0; i < count; i++) {
++		struct elf_phdr ph;
++
++		memcpy(&ph, mdt + 52 + 32 * i, sizeof(ph));
++		if (i == 0) {
++			ehdr_size = ph.file_size;
++		} else if (MDT_HASH(ph.flags) && hash_size == 0) {
++			hash_size = ph.file_size;
++		}
++		if (ph.type != 1 || MDT_HASH(ph.flags) || ph.memory_size == 0 || segments >= MAX_SEGMENTS) {
++			continue;
++		}
++		relocate |= (ph.flags & MDT_RELOCATABLE) != 0;
++		lowest = MIN(lowest, ph.paddr);
++		seg[segments].paddr = ph.paddr;
++		seg[segments].file_size = ph.file_size;
++		seg[segments].memory_size = ph.memory_size;
++		seg[segments].index = i;
++		segments++;
++	}
++	mpss_reloc = relocate ? lowest : MPSS_MEMORY;
++	boot_addr = relocate ? MPSS_MEMORY : lowest;
++	for (unsigned i = 0; i < segments; i++) {
++		if (seg[i].paddr < mpss_reloc || (uint64_t)seg[i].paddr - mpss_reloc + seg[i].memory_size > MPSS_SIZE || seg[i].file_size > seg[i].memory_size) {
++			say("eqmss: mss: segment %u is outside the modem region\n", seg[i].index);
++			goto done;
++		}
++	}
++	say("eqmss: mss: modem.mdt: %u bytes (header %u + hashes %u), %u segments from %#x, %s\n", mdt_size, ehdr_size, hash_size, segments, lowest,
++	    relocate ? "relocatable" : "fixed");
++	if (segments == 0 || ehdr_size + hash_size != mdt_size) {
++		say("eqmss: mss: the .mdt is not the packed header+hash layout: stops\n");
++		goto done;
++	}
++	/* the metadata is in the MBA region already (+1 MB, written with the MBA image: TrustZone refuses MP_ASSIGN of a page of ours, EXP-0198) */
++	wr(rmb + RMB_CODE_LENGTH, 0);
++	wr(rmb + RMB_META_DATA, MBA_MEMORY + MBA_META_OFFSET);
++	wr(rmb + RMB_COMMAND, 1);
++	status = mba_wait(rmb, MBA_META_AUTH_OK, 1000);
++	say("eqmss: mss: after META_DATA_READY the MBA says %d (3 is: %s)\n", status, "header authenticated");
++	if (status != MBA_META_AUTH_OK) {
++		goto done;
++	}
++	/* the image: shared between us and the MSS while it is written */
++	announce(6, "(W2f) writes the modem's segments (28 files) into its 120 MB, telling the MBA after each one");
++	if (!assign_mem("mpss", MPSS_MEMORY, MPSS_SIZE, mpss_owners, true, false)) { goto done; }
++	if (!assign_mem("mpss", MPSS_MEMORY, MPSS_SIZE, mpss_owners, true, true)) {
++		goto done;
++	}
++	chunk = kalloc_data(chunk_size, Z_WAITOK);
++	if (chunk == NULL) {
++		goto done;
++	}
++	started = now_us();
++	for (unsigned i = 0; i < segments; i++) {
++		struct fs_file f;
++		char path[40];
++
++		if (seg[i].file_size) {
++			snprintf(path, sizeof(path), "image/modem.b%02u", seg[i].index);
++			if (!fs_lookup(path, &f) || f.size != seg[i].file_size) {
++				say("eqmss: mss: %s missing or of another size\n", path);
++				goto done;
++			}
++		}
++		say("eqmss: mss: segment %u: %#x, %u bytes in memory, %u from %s\n", seg[i].index, seg[i].paddr, seg[i].memory_size, seg[i].file_size, seg[i].file_size ? path : "nothing");
++		for (uint32_t at = 0; at < seg[i].memory_size; at += chunk_size) {
++			uint32_t take = MIN(chunk_size, seg[i].memory_size - at), from_file = 0;
++
++			if (at < seg[i].file_size) {
++				from_file = MIN(take, seg[i].file_size - at);
++				if (fs_file_read(&f, at, chunk, from_file) != 0) {
++					say("eqmss: mss: %s: read error\n", path);
++					goto done;
++				}
++			}
++			memset(chunk + from_file, 0, take - from_file);
++			if (!put_phys((uint64_t)MPSS_MEMORY + (seg[i].paddr - mpss_reloc) + at, chunk, take)) {
++				say("eqmss: mss: no mapping for segment %u\n", seg[i].index);
++				goto done;
++			}
++		}
++		loaded += seg[i].memory_size;
++		used += seg[i].file_size;
++		if (rd(rmb + RMB_CODE_LENGTH) == 0) {
++			wr(rmb + RMB_CODE_START, boot_addr);
++			wr(rmb + RMB_COMMAND, 2);
++		}
++		wr(rmb + RMB_CODE_LENGTH, (uint32_t)loaded);
++		status = (int32_t)rd(rmb + RMB_MBA_STATUS);
++		if (status < 0) {
++			say("eqmss: mss: THE MBA REJECTS SEGMENT %u (status %d)\n", seg[i].index, status);
++			goto done;
++		}
++	}
++	say("eqmss: mss: %u segments, %llu bytes of memory (%u from files) written in %llu ms; MBA status %d\n", segments, loaded, used,
++	    (now_us() - started) / 1000, (int32_t)rd(rmb + RMB_MBA_STATUS));
++	if (!assign_mem("mpss", MPSS_MEMORY, MPSS_SIZE, mpss_owners, false, true)) {
++		goto done;
++	}
++	status = mba_wait(rmb, MBA_AUTH_COMPLETE, 10000);
++	say("eqmss: mss: %s (MBA status %d)\n", status == MBA_AUTH_COMPLETE ? "THE MBA HAS AUTHENTICATED THE MODEM IMAGE AND STARTED IT" : "THE MBA DOES NOT REPORT AUTH COMPLETE", status);
++	if (status != MBA_AUTH_COMPLETE) {
++		goto done;
++	}
++	announce(6, "(W2f) waits for the modem's SMP2P 'up' (bit 1 of slave-kernel), then watches a few seconds more");
++	ok = modem_watch(wait_seconds, hold ? hold * 1000 : 4000);
++
++	{
++		uint32_t size = 0;
++
++		say("eqmss: mss: SMEM items now: 435 (SMP2P) %s, 478 (GLINK descriptor) %s, 479 (GLINK fifo) %s\n", adsp_item(ITEM_SMP2P_THEIRS_ALT, &size) ? "yes" : "no",
++		    adsp_item(ITEM_GLINK_DESCRIPTOR, &size) ? "yes" : "no", adsp_item(ITEM_GLINK_FIFO, &size) ? "yes" : "no");
++	}
++done:
++	(void)dsp_ask_to_stop(5000);
++	kfree_data(mdt, mdt_size);
++	if (chunk) {
++		kfree_data(chunk, chunk_size);
++	}
++	return ok;
++}
++
++
++static bool mss_full_test;
++
+ static void
+ mss_run_mba(void)
+ {
+@@ -1031,18 +1958,30 @@ mss_run_mba(void)
+ 	vm_offset_t rmb = 0, pdc = 0, restart = 0, q6 = 0, tcsr = 0, image;
+ 	uint8_t *mba_file;
+ 	uint32_t file_size = 0, value;
++	uint8_t *mdt = NULL;
++	uint32_t mdt_size = 0;
+ 	uint32_t address;
+ 	bool halted = true;
+ 
+-	announce(5, "(W2e) writes mba.mbn into the MBA region, then brings the modem up as Linux q6v5_mba_load does and starts its Q6 (no modem image)");
++	announce(5, "(W2e) writes mba.mbn into the MBA region, then brings the modem up as Linux q6v5_mba_load does and starts its Q6 (MPSS loaded only in sweetmss=6)");
+ 	mba_file = fs_slurp("image/mba.mbn", &file_size);
+ 	if (mba_file == NULL || file_size > MBA_SIZE) {
+ 		say("eqmss: mss: mba.mbn not read or too big\n");
+ 		if (mba_file != NULL) { kfree_data(mba_file, file_size); }
+ 		return;
+ 	}
++	if (mss_full_test) {
++		mdt = fs_slurp("image/modem.mdt", &mdt_size);
++		if (!mdt || !mpss_validate(mdt, mdt_size, true) || !modem_prepare_smp2p()) {
++			say("eqmss: MPSS preflight/SMP2P preparation failed; Q6 not started\n");
++			if (mdt) { kfree_data(mdt, mdt_size); }
++			kfree_data(mba_file, file_size); return;
++		}
++		say("eqmss: MPSS metadata and all segment file sizes checked\n");
++	}
+ 	image = io_map(MBA_MEMORY, MBA_SIZE, VM_WIMG_WCOMB, VM_PROT_READ | VM_PROT_WRITE, true);
+ 	if (image == 0) {
++		if (mdt) { kfree_data(mdt, mdt_size); }
+ 		kfree_data(mba_file, file_size);
+ 		return;
+ 	}
+@@ -1050,12 +1989,24 @@ mss_run_mba(void)
+ 	settle();
+ 	if (memcmp((void *)image, mba_file, file_size) != 0) {
+ 		say("eqmss: mss: THE MBA IMAGE READS BACK DIFFERENTLY: stops\n");
++		if (mdt) { kfree_data(mdt, mdt_size); }
+ 		ml_io_unmap(image, MBA_SIZE);
+ 		kfree_data(mba_file, file_size);
+ 		return;
+ 	}
+ 	say("eqmss: mss: mba.mbn (%u bytes) is in the MBA region and reads back the same\n", file_size);
+ 
++	if (mdt) {
++		memcpy((void *)(image + MBA_META_OFFSET), mdt, mdt_size);
++		settle();
++		bool same = memcmp((void *)(image + MBA_META_OFFSET), mdt, mdt_size) == 0;
++		kfree_data(mdt, mdt_size); mdt = NULL;
++		if (!same) {
++			say("eqmss: packed metadata readback mismatch; stopping\n");
++			ml_io_unmap(image, MBA_SIZE); kfree_data(mba_file, file_size); return;
++		}
++		say("eqmss: packed modem.mdt copied and read back at MBA +1 MiB\n");
++	}
+ 	ml_io_unmap(image, MBA_SIZE);                   /* the region goes to the MSS: nothing of ours may touch it */
+ 	kfree_data(mba_file, file_size);
+ 
+@@ -1121,8 +2072,11 @@ mss_run_mba(void)
+ 	ok = value == 1 || value == 2;
+ 	if (ok) {
+ 		say("eqmss: mss: THE MBA RUNS ON THE MODEM'S Q6 AND SAYS IT UNLOCKED THE XPU\n");
++		if (mss_full_test) { ok = equuleus_mpss_load(rmb, &mpss_owners); }
++		else {
+ 		delay_for_interval(1000, NSEC_PER_MSEC);
+ 		say("eqmss: a second later MBA_STATUS %d, PBL %#x\n", (int32_t)rd(rmb + RMB_MBA_STATUS), rd(rmb + RMB_PBL_STATUS));
++		}
+ 	}
+ out:
+ 	announce(5, "(W2e) takes it all back as Linux q6v5_mba_reclaim does: halt the AXI ports, reset, clocks, memory, rails, QMP");
+@@ -1162,7 +2116,7 @@ out:
+ 	if (mba_owners != (1ull << VMID_HLOS) || mpss_owners != (1ull << VMID_HLOS)) {
+ 		say("eqmss: mss: A REGION IS STILL THE MODEM'S: DO NOT TOUCH IT (mba %#llx, mpss %#llx)\n", mba_owners, mpss_owners);
+ 	}
+-	say("eqmss: mss: W2%c done: %s\n", 'e', ok ? "the MBA ran and cleanup was attempted" : "A STEP FAILED; inspect cleanup messages");
++	say("eqmss: mss: W2%c done: %s\n", mss_full_test ? 'f' : 'e', ok ? (mss_full_test ? "MPSS READY observed; inspect stop/reclaim above" : "the MBA ran and cleanup was attempted") : "A STEP FAILED; inspect cleanup messages");
+ }
+ 
+ /* Called on the existing delayed WLAN thread, once, only for equuleus. */
+@@ -1175,16 +2129,17 @@ equuleus_mss_probe(void)
+         !PE_parse_boot_argn("sweetmss", &mode, sizeof(mode)) || mode == 0) {
+         return;
+     }
+-    if (mode != 1 && mode != 2 && mode != 5) {
+-        say("eqmss: supported sweetmss modes: 1 survey, 2 rails/clocks, 5 MBA only\n");
++    if (mode != 1 && mode != 2 && mode != 5 && mode != 6) {
++        say("eqmss: supported sweetmss modes: 1 survey, 2 rails/clocks, 5 MBA only, 6 MPSS/SMP2P\n");
+         return;
+     }
+     entered = true;
+-    say("eqmss: port 0149, mode %u; no modem image or Wi-Fi driver\n", mode);
++    say("eqmss: port 0150, mode %u; no Wi-Fi driver or GLINK host services\n", mode);
+     mss_w2a();
+     if (mode == 2) {
+         mss_w2bc(2);
+-    } else if (mode == 5) {
++    } else if (mode == 5 || mode == 6) {
++        mss_full_test = mode == 6;
+         mss_run_mba();
+     }
+     say("eqmss: test finished; reboot fully before another hardware test\n");

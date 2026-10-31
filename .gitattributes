@@ -5,3 +5,4 @@ xnu/patches/0146-equuleus-stm-fifo-probe.patch -whitespace
 xnu/patches/0147-equuleus-stm-hid-touch.patch -whitespace
 xnu/patches/0148-equuleus-smem-table-stride.patch -whitespace
 xnu/patches/0149-equuleus-mss-mba-bringup.patch -whitespace
+xnu/patches/0150-equuleus-mpss-smp2p-bringup.patch -whitespace
