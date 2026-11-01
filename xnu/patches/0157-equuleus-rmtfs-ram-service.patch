@@ -1,0 +1,423 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -120,4 +120,5 @@
+ bsd/dev/equuleus_glink.c		standard
+ bsd/dev/equuleus_servreg.c		standard
++bsd/dev/equuleus_rmtfs.c		standard
+ bsd/dev/mi8_hostsvc_k.c			standard
+ bsd/dev/beryllium_bt_hci.c		standard
+diff --git a/bsd/dev/equuleus_mss.c b/bsd/dev/equuleus_mss.c
+index ddfd0ca..0a1486e 100644
+--- a/bsd/dev/equuleus_mss.c
++++ b/bsd/dev/equuleus_mss.c
+@@ -22,6 +22,7 @@
+ #include "equuleus_servreg.h"
+ #include "mi8_hostsvc.h"
+ #include "equuleus_rmtfs_contract.h"
++#include "equuleus_rmtfs.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void ml_io_unmap(vm_offset_t, vm_size_t);
+@@ -1789,6 +1790,11 @@ modem_watch(uint32_t seconds, uint32_t after_ready_ms)
+ static bool mss_glink_test;
+ static bool mss_servreg_test;
+ static bool mss_hostsvc_test;
++static bool mss_rmtfs_test;
++static struct equuleus_rmtfs *mss_rmtfs;
++static vm_offset_t mss_rmt_pool;
++static bool mss_rmt_share_attempted, mss_rmt_shared;
++static uint64_t mss_rmt_owners = 1ull << VMID_HLOS;
+ static void eq_servreg_log(void *ctx, const char *event, uint32_t a, uint32_t b)
+ {
+ 	(void)ctx; say("eqsr: %s: %#x %#x\n", event, a, b);
+@@ -1918,6 +1924,32 @@ static const struct mi8_pd_domain eq_domains[] = {
+  { "msm/modem/wlan_pd", 180, eq_wlan_services, 3 }
+ };
+ 
++extern int sweet_ufs_part_size(const char *, uint8_t *, uint64_t *);
++/* Named reads only; RAM shadows are the sole writable backing. */
++static int eq_rmt_part_size(void *ctx,const char *name,uint64_t *size)
++{
++ uint8_t lun=0;(void)ctx;return sweet_ufs_part_size(name,&lun,size);
++}
++static int eq_rmt_part_read(void *ctx,const char *name,uint64_t at,void *out,uint64_t n)
++{
++ (void)ctx;return sweet_ufs_read_part(name,at,out,n);
++}
++static bool eq_rmt_share_start(struct mi8_glink *g)
++{
++ if(!mss_rmtfs || !mss_rmt_pool || mss_rmt_share_attempted)return false;
++ /* A failed SCM call is treated as uncertain ownership: never retry/reuse. */
++ mss_rmt_share_attempted=true;
++ if(!assign_mem("rmtfs",EQ_RMT_DATA,EQ_RMT_BYTES,&mss_rmt_owners,true,true)) {
++  say("eqrf: SCM share failed; pool retained, no RMTFS publication; full reboot required\n");return false;
++ }
++ mss_rmt_shared=true;
++ if(equuleus_rmtfs_start(mss_rmtfs,mi8_glink_qrtr_ops(g),eq_host_publish,g)) {
++  say("eqrf: RMTFS publish failed; shared pool retained until reboot\n");return false;
++ }
++ say("eqrf: port0157 mode12 RMTFS started; HLOS+MSS pool=%#llx bytes=%#llx\n",(uint64_t)EQ_RMT_DATA,(uint64_t)EQ_RMT_BYTES);
++ return true;
++}
++
+ void
+ equuleus_glink_probe(void)
+ {
+@@ -1925,7 +1957,7 @@ equuleus_glink_probe(void)
+ 	struct equuleus_servreg sr;
+ 	struct mi8_hostsvc *hs = NULL;
+ 	bool sr_started = false;
+-	uint64_t budget = mss_hostsvc_test ? 30000000ull : (mss_servreg_test ? 20000000ull : 10000000ull);
++	uint64_t budget = mss_rmtfs_test ? 60000000ull : mss_hostsvc_test ? 30000000ull : (mss_servreg_test ? 20000000ull : 10000000ull);
+ 	struct mi8_glink_cfg cfg;
+ 	struct mi8_glink *g = NULL;
+ 	struct mi8_qrtr_server servers[64];
+@@ -1936,7 +1968,7 @@ equuleus_glink_probe(void)
+ 	say("eqgl: bounded GLINK/QRTR; servreg=%u budget_us=%llu; firmware_services=%u\n", mss_servreg_test ? 1u : 0u, budget, mss_hostsvc_test ? 1u : 0u);
+ 	bzero(&sr, sizeof(sr));
+ 	bzero(&io, sizeof(io)); bzero(&cfg, sizeof(cfg));
+-	for (unsigned poll = 0; poll < (mss_hostsvc_test ? 60000u : (mss_servreg_test ? 40000u : 20000u)) && now_us() - began < budget; poll++) {
++	for (unsigned poll = 0; poll < (mss_rmtfs_test ? 120000u : mss_hostsvc_test ? 60000u : (mss_servreg_test ? 40000u : 20000u)) && now_us() - began < budget; poll++) {
+ 		if (poll % 200 == 0) {
+ 			struct smp2p state;
+ 			if (!dsp_words(&state) || (dsp_state(&state) & DSP_FATAL)) { result = EIO; break; }
+@@ -1952,6 +1984,7 @@ equuleus_glink_probe(void)
+ 			result = mi8_glink_start(g);
+ 			if (result) { break; }
+ 			started = true;
++            if (mss_rmtfs_test && !eq_rmt_share_start(g)) { result=EIO; break; }
+             if (mss_hostsvc_test) {
+                 struct mi8_hostsvc_cfg hc; bzero(&hc, sizeof(hc));
+                 hc.qrtr=mi8_glink_qrtr_ops(g); hc.publish=eq_host_publish;
+@@ -1959,7 +1992,7 @@ equuleus_glink_probe(void)
+                 hc.domains=eq_domains; hc.n_domains=2; hc.ctx=g; hc.log=eq_glink_log;
+                 hs=mi8_hostsvc_create(&hc);
+                 if (!hs || mi8_hostsvc_start(hs)) { result=EIO; break; }
+-                say("eqhs: mode10 firmware-only services64/4096; RMTFS14 disabled; no NV writes\n");
++                say("eqhs: firmware services64/4096 enabled; RMTFS14=%u; no NV writes\n",mss_rmtfs_test?1u:0u);
+             }
+ 			if (mss_servreg_test) {
+ 				sr_started = equuleus_servreg_start(&sr, mi8_glink_qrtr_ops(g), eq_servreg_log, NULL) == 0;
+@@ -1969,7 +2002,9 @@ equuleus_glink_probe(void)
+ 		if (started) {
+ 			mi8_glink_poll_once(g);
+ 			if (io.fault) { result = EFAULT; break; }
+-			if (hs) { mi8_hostsvc_poll(hs); }
++			if (mss_rmtfs_test) { equuleus_rmtfs_poll(mss_rmtfs); }
++			if (io.fault) { result=EFAULT; break; }
++			if (hs && now_us()-began<budget) { mi8_hostsvc_poll(hs); }
+ 			if (io.fault) { result = EFAULT; break; }
+ 			if (sr_started && now_us() - began < budget) { equuleus_servreg_poll(&sr, now_us()); }
+ 			if (io.fault) { result = EFAULT; break; }
+@@ -1986,6 +2021,7 @@ equuleus_glink_probe(void)
+ 			say("eqsr: summary registered=%u up=%u state=%#x attempts=%u sends=%u notifications=%u ack_ok=%u rejected=%u pending=%u\n", sr.registered, sr.up, sr.state, sr.attempts, sr.sends, sr.notifications, sr.acknowledgements, sr.rejected, sr.count + (sr.ack_txn != 0));
+ 			equuleus_servreg_stop(&sr);
+ 		}
++		if (mss_rmtfs_test) { equuleus_rmtfs_stop(mss_rmtfs); }
+ 		if (hs) { mi8_hostsvc_destroy(hs); }
+ 		mi8_glink_destroy(g);
+ 	} else { say("eqgl: transport not started result=%d (items478/479/480 required)\n", result); }
+@@ -2444,6 +2480,28 @@ out:
+  say("eqrmt: preflight %s; pool remains CPU-owned until full reboot\n",ok?"PASS":"FAIL");
+ }
+ 
++/* Full snapshot and CPU contract checks occur before any modem hardware work. */
++bool equuleus_rmtfs_prepare(void)
++{
++ unsigned stamp=0;
++ struct eq_rmt_contract contract;
++ if(!PE_parse_boot_argn("eqrmtfs_pool",&stamp,sizeof(stamp)) || stamp!=156 || PAGE_SIZE!=EQ_RMT_PAGE || mss_rmt_share_attempted)return false;
++ if(!mss_rmt_pool)mss_rmt_pool=io_map(EQ_RMT_POOL,EQ_RMT_SPAN,VM_WIMG_WCOMB,VM_PROT_READ|VM_PROT_WRITE,true);
++ if(!mss_rmt_pool)return false;
++ volatile uint64_t *pool=(volatile uint64_t *)mss_rmt_pool;
++ uint64_t *words=(uint64_t *)&contract;
++ for(unsigned i=0;i<sizeof(contract)/8;i++)words[i]=pool[i];
++ if(!eq_rmt_valid(&contract) || !eq_rmt_guards(pool))return false;
++ volatile uint64_t *data=(volatile uint64_t *)(mss_rmt_pool+2*EQ_RMT_PAGE);
++ for(uint64_t i=0;i<EQ_RMT_BYTES/8;i++)if(data[i])return false;
++ struct equuleus_rmtfs_cfg cfg; bzero(&cfg,sizeof(cfg));
++ cfg.shared=(void *)data;cfg.physical=EQ_RMT_DATA;cfg.size=EQ_RMT_BYTES;
++ cfg.part_size=eq_rmt_part_size;cfg.part_read=eq_rmt_part_read;cfg.log=eq_glink_log;
++ mss_rmtfs=equuleus_rmtfs_create(&cfg);
++ if(!mss_rmtfs){say("eqrf: full RAM snapshot preparation failed; modem not started\n");return false;}
++ say("eqrf: full read-only partition snapshots ready; no SCM sharing yet\n");return true;
++}
++
+ void
+ equuleus_mss_probe(void)
+ {
+@@ -2453,25 +2511,32 @@ equuleus_mss_probe(void)
+         !PE_parse_boot_argn("sweetmss", &mode, sizeof(mode)) || mode == 0) {
+         return;
+     }
+-    if (mode != 1 && mode != 2 && mode != 5 && mode != 6 && mode != 7 && mode != 8 && mode != 9 && mode != 10 && mode != 11) {
+-        say("eqmss: supported sweetmss modes: 1 survey, 2 rails/clocks, 5 MBA only, 6 MPSS/SMP2P, 7 MPSS with explicit HALT on all ports, 8 GLINK/QRTR probe, 9 servreg listener, 10 firmware host services, 11 RMTFS preflight\n");
++    if (mode != 1 && mode != 2 && mode != 5 && mode != 6 && mode != 7 && mode != 8 && mode != 9 && mode != 10 && mode != 11 && mode != 12) {
++        say("eqmss: supported sweetmss modes: 1 survey, 2 rails/clocks, 5 MBA only, 6 MPSS/SMP2P, 7 MPSS with explicit HALT on all ports, 8 GLINK/QRTR probe, 9 servreg listener, 10 firmware host services, 11 RMTFS preflight, 12 RMTFS RAM shadow test\n");
+         return;
+     }
+     entered = true;
+     if (mode == 11) { equuleus_rmtfs_preflight(); return; }
+-    say("eqmss: port 0155, mode %u; GLINK mode8/9/10, servreg mode9/10, firmware services mode10; no Wi-Fi\n", mode);
++    mss_rmtfs_test = mode == 12;
++    if (mss_rmtfs_test && !equuleus_rmtfs_prepare()) { say("eqrf: prepare refused; full reboot required\n"); return; }
++    say("eqmss: port 0157, mode %u; GLINK mode8/9/10/12, servreg mode9/10/12, firmware services mode10/12; no Wi-Fi\n", mode);
+     mss_w2a();
+     if (mode == 2) {
+         mss_w2bc(2);
+-    } else if (mode == 5 || mode == 6 || mode == 7 || mode == 8 || mode == 9 || mode == 10) {
++    } else if (mode == 5 || mode == 6 || mode == 7 || mode == 8 || mode == 9 || mode == 10 || mode == 12) {
+         mss_halt_all = mode == 7;
+-        mss_full_test = mode == 6 || mode == 7 || mode == 8 || mode == 9 || mode == 10;
+-        mss_glink_test = mode == 8 || mode == 9 || mode == 10;
+-        mss_servreg_test = mode == 9 || mode == 10;
+-        mss_hostsvc_test = mode == 10;
++        mss_full_test = mode == 6 || mode == 7 || mode == 8 || mode == 9 || mode == 10 || mode == 12;
++        mss_glink_test = mode == 8 || mode == 9 || mode == 10 || mode == 12;
++        mss_servreg_test = mode == 9 || mode == 10 || mode == 12;
++        mss_hostsvc_test = mode == 10 || mode == 12;
+         say("eqmss: explicit AXI HALT on all ports: %u\n", mss_halt_all ? 1u : 0u);
+         mss_run_mba();
+     }
++    if (mss_rmtfs_test) {
++        if (mss_rmt_pool && !eq_rmt_guards((volatile uint64_t *)mss_rmt_pool)) say("eqrf: WARNING pool guard changed\n");
++        equuleus_rmtfs_destroy(mss_rmtfs); mss_rmtfs=NULL;
++        say("eqrf: shared_attempted=%u shared=%u; reserved pool is never reclaimed/reused in this boot\n",mss_rmt_share_attempted,mss_rmt_shared);
++    }
+     say("eqmss: test finished; reboot fully before another hardware test\n");
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/equuleus_rmtfs.c b/bsd/dev/equuleus_rmtfs.c
+new file mode 100644
+index 0000000..a922bb4
+--- /dev/null
++++ b/bsd/dev/equuleus_rmtfs.c
+@@ -0,0 +1,196 @@
++/*
++ * MIT License
++ *
++ * Copyright (c) 2026 yanei and dipper-xnu contributors
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ * RMTFS wire semantics adapted from dipper-xnu 4e82c709ea42ebb509fa101b52972fdc890b873e.
++ * Equuleus RMTFS: pinned wire semantics, complete RAM snapshots, bounded polling and replay.
++ */
++#include "equuleus_rmtfs.h"
++#ifdef EQ_RMTFS_HOST_TEST
++#include <stdlib.h>
++#include <string.h>
++#ifndef RMT_ALLOC
++#define RMT_ALLOC(n) calloc(1,n)
++#define RMT_FREE(p,n) free(p)
++#endif
++#else
++#include <kern/kalloc.h>
++#include <libkern/libkern.h>
++#define RMT_ALLOC(n) kalloc_data(n,Z_WAITOK|Z_ZERO)
++#define RMT_FREE(p,n) kfree_data(p,n)
++#endif
++#define RMT_MAX 8192u
++#define RMT_HANDLES 32u
++#define RMT_QUEUE 8u
++#define RMT_CACHE 16u
++#define RMT_LIMIT 4096u
++/* QMI error numbers and OPEN/CLOSE/RW/ALLOC/DEVERR/SYNC messages from donor. */
++enum { R_OK=0,R_MALFORMED=1,R_NOMEM=2,R_INTERNAL=3,R_BAD_HANDLE=9,R_INVALID=48,R_UNSUPPORTED=94 };
++struct rmt_tlv {const uint8_t *p;unsigned n;};
++struct rmt_handle {uint32_t id,node;unsigned part;bool live;};
++struct rmt_request {struct rmt_request *next;uint32_t node,port,n;uint8_t data[];};
++struct rmt_replay {uint32_t node,port,n,rn;uint8_t request[RMT_MAX],response[32];};
++struct equuleus_rmtfs {
++ struct equuleus_rmtfs_cfg cfg;
++ const struct redwood_qrtr_ops *ops;struct redwood_qrtr_port *port;
++ uint8_t *shadow[6];
++ struct rmt_handle handles[RMT_HANDLES];
++ struct rmt_request *head,*tail;
++ struct rmt_replay cache[RMT_CACHE];
++ uint32_t next_id,queued,requests,replies,rejected,replayed,reads,writes,cache_next;
++ bool started,dispatching;
++};
++static const char *const rmt_names[]={"modemst1","modemst2","fsg","fsc"};
++static const uint32_t rmt_sizes[]={0x800000,0x800000,0x800000,0x40000,0x100000,0x100000};
++static const char *const rmt_paths[]={"/boot/modem_fs1","/boot/modem_fs2","/boot/modem_fsg","/boot/modem_fsc","/boot/modem_fsg_oem_1","/boot/modem_fsg_oem_2"};
++static uint64_t rmt_le(const uint8_t *p,unsigned n){uint64_t v=0;for(unsigned i=0;i<n;i++)v|=(uint64_t)p[i]<<(8*i);return v;}
++static void rmt_put(uint8_t *p,uint64_t v,unsigned n){for(unsigned i=0;i<n;i++)p[i]=(uint8_t)(v>>(8*i));}
++static void rmt_wipe(void *p,size_t n){volatile uint8_t *v=p;while(n--)*v++=0;}
++static bool rmt_parse(const uint8_t *p,unsigned n,struct rmt_tlv *t){
++ memset(t,0,256*sizeof(*t));
++ while(n){if(n<3)return false;unsigned tag=p[0],len=(unsigned)rmt_le(p+1,2);if(len>n-3 || t[tag].p)return false;t[tag].p=p+3;t[tag].n=len;p+=3+len;n-=3+len;}
++ return true;
++}
++static bool rmt_has(const struct rmt_tlv *t,unsigned tag,unsigned n){return t[tag].p && t[tag].n==n;}
++static unsigned rmt_run(struct equuleus_rmtfs *r,uint32_t node,unsigned msg,const struct rmt_tlv *t,uint8_t *reply,unsigned *length){
++ if(msg==1){
++  unsigned part=6;
++  if(!t[1].p || !t[1].n || t[1].n>255)return R_MALFORMED;
++  for(unsigned i=0;i<6;i++)if(strlen(rmt_paths[i])==t[1].n && !memcmp(rmt_paths[i],t[1].p,t[1].n)){part=i;break;}
++  if(part==6)return R_INVALID;
++  unsigned slot=RMT_HANDLES;for(unsigned i=0;i<RMT_HANDLES;i++)if(!r->handles[i].live){slot=i;break;}
++  if(slot==RMT_HANDLES || r->next_id==UINT32_MAX)return R_NOMEM;
++  struct rmt_handle *h=&r->handles[slot];h->id=++r->next_id;h->node=node;h->part=part;h->live=true;
++  reply[14]=0x10;rmt_put(reply+15,4,2);rmt_put(reply+17,h->id,4);*length=21;
++  if(r->cfg.log)r->cfg.log(r->cfg.ctx,"eqrf: open partition_index=%u handle=%u (RAM only)\n",part,h->id);
++  return R_OK;
++ }
++ if(msg<2 || msg>6)return R_UNSUPPORTED;
++ if(!rmt_has(t,1,4))return R_MALFORMED;
++ uint32_t id=(uint32_t)rmt_le(t[1].p,4);
++ if(msg==4){
++  if(!rmt_has(t,2,4))return R_MALFORMED;
++  uint32_t n=(uint32_t)rmt_le(t[2].p,4);
++  /* DT qcom,client-id=1. The field is NOT an OPEN handle. */
++  if(id!=1 || !n || n>r->cfg.size)return R_INVALID;
++  reply[14]=0x10;rmt_put(reply+15,8,2);rmt_put(reply+17,r->cfg.physical,8);*length=25;
++  if(r->cfg.log)r->cfg.log(r->cfg.ctx,"eqrf: alloc client=%u bytes=%u\n",id,n);
++  return R_OK;
++ }
++ struct rmt_handle *h=NULL;
++ /* Real modem moves requests between QRTR ports; bind handles to node, not port. */
++ for(unsigned i=0;i<RMT_HANDLES;i++)if(r->handles[i].live && r->handles[i].id==id && r->handles[i].node==node){h=&r->handles[i];break;}
++ if(!h)return R_BAD_HANDLE;
++ if(msg==3){
++  if(!rmt_has(t,2,1) || !t[3].p || !t[3].n || (t[4].p && !rmt_has(t,4,1)))return R_MALFORMED;
++  unsigned direction=t[2].p[0],count=t[3].p[0];uint64_t total=0;
++  if(direction>1 || !count || t[3].n!=1+12*count)return R_INVALID;
++  /* Validate ALL vectors before changing any byte; offsets are in 512B sectors. */
++  for(unsigned i=0;i<count;i++){
++   const uint8_t *v=t[3].p+1+12*i;
++   uint64_t offset=rmt_le(v,4)*512,physical=rmt_le(v+4,4),bytes=rmt_le(v+8,4)*512;
++   if(!bytes || offset>rmt_sizes[h->part] || bytes>rmt_sizes[h->part]-offset || physical<r->cfg.physical || physical-r->cfg.physical>r->cfg.size || bytes>r->cfg.size-(physical-r->cfg.physical) || total>r->cfg.size || bytes>r->cfg.size-total)return R_INVALID;
++   total+=bytes;
++  }
++  __sync_synchronize();
++  for(unsigned i=0;i<count;i++){
++   const uint8_t *v=t[3].p+1+12*i;size_t offset=(size_t)(rmt_le(v,4)*512),bytes=(size_t)(rmt_le(v+8,4)*512);
++   uint8_t *shared=(uint8_t *)r->cfg.shared+(rmt_le(v+4,4)-r->cfg.physical);
++   if(direction)memcpy(shared,r->shadow[h->part]+offset,bytes);
++   else memcpy(r->shadow[h->part]+offset,shared,bytes);
++  }
++  __sync_synchronize();if(direction)r->reads++;else r->writes++;
++  if(r->cfg.log && r->reads+r->writes<=20)r->cfg.log(r->cfg.ctx,"eqrf: rw dir=%u vectors=%u bytes=%llu (RAM only)\n",direction,count,(unsigned long long)total);
++ } else if(msg==2)h->live=false;
++ else if(msg==5){reply[14]=0x10;rmt_put(reply+15,4,2);rmt_put(reply+17,0,4);*length=21;}
++ /* SYNC acknowledges RAM state only; no persistent writer exists. */
++ return R_OK;
++}
++static void rmt_receive(void *ctx,uint32_t node,uint32_t port,const void *data,size_t n){
++ struct equuleus_rmtfs *r=ctx;
++ if(!r->started)return;
++ if(node!=0 || !port || port>=0xfffffffeu || !data || n<7 || n>RMT_MAX || r->queued>=RMT_QUEUE || r->requests>=RMT_LIMIT){r->rejected++;return;}
++ struct rmt_request *q=RMT_ALLOC(sizeof(*q)+n);if(!q){r->rejected++;return;}
++ q->next=NULL;q->node=node;q->port=port;q->n=(uint32_t)n;memcpy(q->data,data,n);
++ if(r->tail)r->tail->next=q;else r->head=q;r->tail=q;r->queued++;r->requests++;
++}
++void equuleus_rmtfs_poll(struct equuleus_rmtfs *r){
++ if(!r || !r->started || r->dispatching || !r->head)return;
++ r->dispatching=true;struct rmt_request *q=r->head;r->head=q->next;if(!r->head)r->tail=NULL;
++ uint8_t response[32]={0};unsigned rn=14,error=R_MALFORMED;bool cached=false;
++ /* Validate request flag/length before lookup or dispatch. */
++ if(q->data[0]!=0){r->rejected++;goto done;}
++ for(unsigned i=0;i<RMT_CACHE;i++){
++  struct rmt_replay *c=&r->cache[i];
++  if(c->n==q->n && c->node==q->node && c->port==q->port && !memcmp(c->request,q->data,q->n)){rn=c->rn;memcpy(response,c->response,rn);cached=true;r->replayed++;break;}
++ }
++ if(!cached){
++  response[0]=2;memcpy(response+1,q->data+1,4);
++  struct rmt_tlv *t=RMT_ALLOC(256*sizeof(*t));
++  if(!t)error=R_NOMEM;
++  else{
++   if(rmt_le(q->data+5,2)==q->n-7 && rmt_parse(q->data+7,q->n-7,t))error=rmt_run(r,q->node,(unsigned)rmt_le(q->data+3,2),t,response,&rn);
++   RMT_FREE(t,256*sizeof(*t));
++  }
++  if(error)rn=14;
++  response[7]=2;rmt_put(response+8,4,2);rmt_put(response+10,error?1:0,2);rmt_put(response+12,error,2);rmt_put(response+5,rn-7,2);
++  if(error!=R_NOMEM){struct rmt_replay *c=&r->cache[r->cache_next++%RMT_CACHE];c->node=q->node;c->port=q->port;c->n=q->n;c->rn=rn;memcpy(c->request,q->data,q->n);memcpy(c->response,response,rn);}
++  if(error){r->rejected++;if(r->cfg.log && r->rejected<=20)r->cfg.log(r->cfg.ctx,"eqrf: request msg=%u error=%u\n",(unsigned)rmt_le(q->data+3,2),error);}
++ }
++ if(r->replies<RMT_LIMIT){r->replies++;int result=r->ops->send(r->port,q->node,q->port,response,rn);if(result && r->cfg.log)r->cfg.log(r->cfg.ctx,"eqrf: send errno=%d\n",result);}
++done:
++ r->queued--;RMT_FREE(q,sizeof(*q)+q->n);r->dispatching=false;
++}
++struct equuleus_rmtfs *equuleus_rmtfs_create(const struct equuleus_rmtfs_cfg *cfg){
++ if(!cfg || !cfg->shared || !cfg->physical || !cfg->part_size || !cfg->part_read || cfg->size!=0x200000 || (cfg->physical&0x3fff) || cfg->physical>0x100000000ull-cfg->size)return NULL;
++ struct equuleus_rmtfs *r=RMT_ALLOC(sizeof(*r));if(!r)return NULL;memset(r,0,sizeof(*r));r->cfg=*cfg;
++ for(unsigned i=0;i<6;i++){
++  if(i<4){uint64_t size=0;if(cfg->part_size(cfg->ctx,rmt_names[i],&size) || size!=rmt_sizes[i])goto fail;}
++  r->shadow[i]=RMT_ALLOC(rmt_sizes[i]);if(!r->shadow[i])goto fail;memset(r->shadow[i],0,rmt_sizes[i]);
++  if(i<4)for(uint64_t offset=0;offset<rmt_sizes[i];offset+=0x10000){uint64_t n=rmt_sizes[i]-offset;if(n>0x10000)n=0x10000;if(cfg->part_read(cfg->ctx,rmt_names[i],offset,r->shadow[i]+offset,n))goto fail;}
++  if(cfg->log)cfg->log(cfg->ctx,"eqrf: snapshot index=%u bytes=%u source=%s\n",i,rmt_sizes[i],i<4?"partition read-only":"blank RAM OEM");
++ }
++ return r;
++fail:
++ equuleus_rmtfs_destroy(r);return NULL;
++}
++int equuleus_rmtfs_start(struct equuleus_rmtfs *r,const struct redwood_qrtr_ops *ops,
++ int (*publish)(void *,struct redwood_qrtr_port *,uint32_t,uint32_t,uint32_t),void *ctx){
++ if(!r || r->started || !ops || !ops->open || !ops->send || !ops->close || !publish)return 22;
++ r->ops=ops;r->port=ops->open(rmt_receive,NULL,r);if(!r->port)return 12;r->started=true;
++ int result=publish(ctx,r->port,14,1,1);if(result){equuleus_rmtfs_stop(r);return result;}
++ if(r->cfg.log)r->cfg.log(r->cfg.ctx,"eqrf: published service14/v1/instance1 (RAM shadows only)\n");
++ return 0;
++}
++void equuleus_rmtfs_stop(struct equuleus_rmtfs *r){
++ if(!r)return;
++ if(r->port)r->ops->close(r->port);
++ r->port=NULL;r->started=false;
++ struct rmt_request *q;while((q=r->head)){r->head=q->next;RMT_FREE(q,sizeof(*q)+q->n);}r->tail=NULL;r->queued=0;
++ memset(r->handles,0,sizeof(r->handles));memset(r->cache,0,sizeof(r->cache));r->cache_next=0;
++ if(r->cfg.log)r->cfg.log(r->cfg.ctx,"eqrf: summary requests=%u replies=%u replayed=%u rejected=%u read_batches=%u write_batches=%u (no NV writes)\n",r->requests,r->replies,r->replayed,r->rejected,r->reads,r->writes);
++}
++void equuleus_rmtfs_destroy(struct equuleus_rmtfs *r){
++ if(!r)return;
++ equuleus_rmtfs_stop(r);
++ for(unsigned i=0;i<6;i++)if(r->shadow[i]){rmt_wipe(r->shadow[i],rmt_sizes[i]);RMT_FREE(r->shadow[i],rmt_sizes[i]);}
++ rmt_wipe(r,sizeof(*r));RMT_FREE(r,sizeof(*r));
++}
+diff --git a/bsd/dev/equuleus_rmtfs.h b/bsd/dev/equuleus_rmtfs.h
+new file mode 100644
+index 0000000..03f8c68
+--- /dev/null
++++ b/bsd/dev/equuleus_rmtfs.h
+@@ -0,0 +1,25 @@
++/* SPDX-License-Identifier: MIT
++ * Wire protocol adapted from yanei/dipper-xnu mi8_hostsvc.c, pinned
++ * 4e82c709ea42ebb509fa101b52972fdc890b873e. Full notice in .c.
++ */
++#pragma once
++#include "equuleus_glink.h"
++struct equuleus_rmtfs_cfg {
++ void *shared;
++ uint64_t physical;
++ uint32_t size;
++ int (*part_size)(void *, const char *, uint64_t *);
++ int (*part_read)(void *, const char *, uint64_t, void *, uint64_t);
++ void (*log)(void *, const char *, ...);
++ void *ctx;
++};
++struct equuleus_rmtfs;
++/* Create reads complete snapshots of exactly the four audited partitions.
++ * No filesystem write callback exists. Two donor OEM paths use blank RAM. */
++struct equuleus_rmtfs *equuleus_rmtfs_create(const struct equuleus_rmtfs_cfg *);
++int equuleus_rmtfs_start(struct equuleus_rmtfs *, const struct redwood_qrtr_ops *,
++ int (*)(void *, struct redwood_qrtr_port *, uint32_t, uint32_t, uint32_t), void *);
++void equuleus_rmtfs_poll(struct equuleus_rmtfs *);
++void equuleus_rmtfs_stop(struct equuleus_rmtfs *);
++/* Does not zero, free, unmap or reclaim the modem's shared physical buffer. */
++void equuleus_rmtfs_destroy(struct equuleus_rmtfs *);

@@ -13,3 +13,4 @@ xnu/patches/0154-equuleus-servreg-listener.patch -whitespace
 xnu/patches/0155-equuleus-firmware-host-services.patch -whitespace
 xnu/patches/0156-equuleus-rmtfs-pool-preflight.patch -whitespace
 tools/patches/0156-equuleus-rmtfs-shim.patch -whitespace
+xnu/patches/0157-equuleus-rmtfs-ram-service.patch -whitespace

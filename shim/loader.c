@@ -116,9 +116,17 @@ const char *loader_boot(uintptr_t dtb)
  volatile uint64_t *guard_lo=(volatile uint64_t *)(EQ_RMT_POOL+EQ_RMT_PAGE);
  volatile uint64_t *guard_hi=(volatile uint64_t *)(EQ_RMT_DATA+EQ_RMT_BYTES);
  for(uint64_t i=0;i<EQ_RMT_PAGE/8;i++)guard_lo[i]=guard_hi[i]=EQ_RMT_GUARD;
- struct eq_rmt_contract contract={EQ_RMT_MAGIC,1,EQ_RMT_POOL,EQ_RMT_SPAN,EQ_RMT_DATA,EQ_RMT_BYTES,EQ_RMT_GUARD,0};
- contract.checksum=eq_rmt_checksum(&contract);
- copy64(EQ_RMT_POOL,(uintptr_t)&contract,sizeof(contract));
+ /* Direct volatile stores avoid compiler-generated memcpy. */
+ volatile struct eq_rmt_contract *contract=(volatile struct eq_rmt_contract *)EQ_RMT_POOL;
+ contract->version=1;
+ contract->pool=EQ_RMT_POOL;
+ contract->span=EQ_RMT_SPAN;
+ contract->data=EQ_RMT_DATA;
+ contract->bytes=EQ_RMT_BYTES;
+ contract->guard=EQ_RMT_GUARD;
+ contract->checksum=EQ_RMT_MAGIC ^ 1ull ^ EQ_RMT_POOL ^ EQ_RMT_SPAN ^ EQ_RMT_DATA ^ EQ_RMT_BYTES ^ EQ_RMT_GUARD;
+ __asm__ volatile("dsb sy" ::: "memory");
+ contract->magic=EQ_RMT_MAGIC;
  __asm__ volatile("dsb sy" ::: "memory");
  con_hex2("RMTFS","data=",(uint32_t)EQ_RMT_DATA,"size=",(uint32_t)EQ_RMT_BYTES);
 #endif
