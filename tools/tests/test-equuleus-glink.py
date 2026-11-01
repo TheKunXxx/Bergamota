@@ -3,6 +3,7 @@
 from pathlib import Path
 import subprocess,tempfile,os
 repo=Path(__file__).resolve().parents[2]
+servreg=bool(os.environ.get('EQUULEUS_TEST_0154'))
 with tempfile.TemporaryDirectory() as td:
  root=Path(td);p=root/'bsd/dev/equuleus_mss.c';p.parent.mkdir(parents=True)
  tail=(repo/'xnu/patches/0149-equuleus-mss-mba-bringup.patch').read_text().split('+++ b/bsd/dev/equuleus_mss.c\n',1)[1]
@@ -10,7 +11,7 @@ with tempfile.TemporaryDirectory() as td:
  conf=root/'bsd/conf/files';conf.parent.mkdir(parents=True)
  conf.write_text('bsd/dev/beryllium_wlan.c\t\tstandard\nbsd/dev/equuleus_mss.c\t\tstandard\nbsd/dev/beryllium_bt_hci.c\t\tstandard\n')
  subprocess.run(['git','init','-q',td],check=True)
- for prefix in ['0150','0151','0152','0153']:
+ for prefix in ['0150','0151','0152','0153']+(['0154'] if servreg else []):
   patch=next((repo/'xnu/patches').glob(prefix+'-*'))
   subprocess.run(['git','apply','--check',str(patch)],cwd=root,check=True)
   subprocess.run(['git','apply',str(patch)],cwd=root,check=True)
@@ -73,7 +74,7 @@ int main(void) {
  c=dev/'test.c';c.write_text(harness);exe=root/'test'
  subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-pthread',str(c),'-o',str(exe)],check=True)
  subprocess.run([str(exe)],check=True,env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0'})
- assert 'mss_glink_test = mode == 8;' in source
+ assert ('mss_glink_test = mode == 8 || mode == 9;' if servreg else 'mss_glink_test = mode == 8;') in source
  assert source.index('equuleus_glink_probe();') < source.index('done:\n\t(void)dsp_ask_to_stop',source.index('equuleus_glink_probe();'))
  adapter=source[source.index('/* 0153:'):source.index('#define MAX_SEGMENTS 48u')]
  assert 'ml_io_' not in adapter and 'assign_mem' not in adapter and 'sweet_ufs' not in adapter
@@ -134,8 +135,11 @@ int main(void) {
  return 0;
 }
 '''
+ if servreg:
+  prefix=prefix.replace('#include \"equuleus_glink.h\"', '#include \"equuleus_servreg.h\"')
+  main=main.replace('equuleus_glink_probe();assert(elapsed<=10000000ull);', 'mss_servreg_test=true;equuleus_glink_probe();assert(elapsed<=20000000ull);')
  c=dev/'adapter.c';c.write_text(prefix+adapter+main)
- subprocess.run(['cc','-std=gnu11','-DMI8_GLINK_HOST_TEST','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-pthread',str(c),str(dev/'equuleus_glink.c'),'-o',str(exe)],check=True)
+ subprocess.run(['cc','-std=gnu11','-DMI8_GLINK_HOST_TEST','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-pthread',str(c),str(dev/'equuleus_glink.c'),*([str(dev/'equuleus_servreg.c')] if servreg else []),'-o',str(exe)],check=True)
  subprocess.run([str(exe)],check=True,env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0'})
  print('Actual equuleus adapter: bounded probe, missing/overlapping/out-of-range items, fatal DSP, read failure and write allowlist checks passed')
  gate=source[source.index('void\nequuleus_mss_probe(void)'):].split('#endif',1)[0]
@@ -163,8 +167,11 @@ int main(int argc,char **argv) {
  return 0;
 }
 '''
+ if servreg:
+  prefix=prefix.replace('mss_glink_test;', 'mss_glink_test,mss_servreg_test;').replace('mode==8));', 'mode==8 || mode==9));assert(mss_servreg_test==(mode==9));')
+  main=main.replace('mode<=8', 'mode<=9')
  c.write_text(prefix+gate+main)
  subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror',str(c),'-o',str(exe)],check=True)
- for mode in [0,1,2,3,5,6,7,8,9]:
+ for mode in [0,1,2,3,5,6,7,8,9]+([10] if servreg else []):
   for board in [0,1]:subprocess.run([str(exe),str(mode),str(board)],check=True)
- print('18 actual boot-entry mode/board cases passed, including one-shot gate and mode8-only GLINK enable')
+ print('%u actual boot-entry mode/board cases passed; one-shot and mode gates verified (0154=%s)' % (20 if servreg else 18,servreg))

@@ -1,0 +1,306 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index b7098e5..b0e19ae 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -1,4 +1,5 @@
+ bsd/dev/beryllium_wlan.c		standard
+ bsd/dev/equuleus_mss.c		standard
+ bsd/dev/equuleus_glink.c		standard
++bsd/dev/equuleus_servreg.c		standard
+ bsd/dev/beryllium_bt_hci.c		standard
+diff --git a/bsd/dev/equuleus_mss.c b/bsd/dev/equuleus_mss.c
+index 45f2bed..34cb388 100644
+--- a/bsd/dev/equuleus_mss.c
++++ b/bsd/dev/equuleus_mss.c
+@@ -19,6 +19,7 @@
+ #include <sys/systm.h>
+ #include "sweet_board.h"
+ #include "equuleus_glink.h"
++#include "equuleus_servreg.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void ml_io_unmap(vm_offset_t, vm_size_t);
+@@ -1784,6 +1785,11 @@ modem_watch(uint32_t seconds, uint32_t after_ready_ms)
+ 
+ /* 0153: bounded dipper GLINK/QRTR transport probe. No RMTFS, file service or WLFW. */
+ static bool mss_glink_test;
++static bool mss_servreg_test;
++static void eq_servreg_log(void *ctx, const char *event, uint32_t a, uint32_t b)
++{
++	(void)ctx; say("eqsr: %s: %#x %#x\n", event, a, b);
++}
+ struct eq_glink_io {
+ 	uint32_t base[3], size[3]; /* descriptor, host TX, modem TX */
+ 	bool fault;
+@@ -1877,6 +1883,9 @@ void
+ equuleus_glink_probe(void)
+ {
+ 	struct eq_glink_io io;
++	struct equuleus_servreg sr;
++	bool sr_started = false;
++	uint64_t budget = mss_servreg_test ? 20000000ull : 10000000ull;
+ 	struct mi8_glink_cfg cfg;
+ 	struct mi8_glink *g = NULL;
+ 	struct mi8_qrtr_server servers[64];
+@@ -1884,9 +1893,10 @@ equuleus_glink_probe(void)
+ 	bool started = false;
+ 	int result = ENOENT;
+ 
+-	say("eqgl: mode8: GLINK/QRTR for at most 10 seconds; no host file services\n");
++	say("eqgl: bounded GLINK/QRTR; servreg=%u budget_us=%llu; no host file services\n", mss_servreg_test ? 1u : 0u, budget);
++	bzero(&sr, sizeof(sr));
+ 	bzero(&io, sizeof(io)); bzero(&cfg, sizeof(cfg));
+-	for (unsigned poll = 0; poll < 20000 && now_us() - began < 10000000ull; poll++) {
++	for (unsigned poll = 0; poll < (mss_servreg_test ? 40000u : 20000u) && now_us() - began < budget; poll++) {
+ 		if (poll % 200 == 0) {
+ 			struct smp2p state;
+ 			if (!dsp_words(&state) || (dsp_state(&state) & DSP_FATAL)) { result = EIO; break; }
+@@ -1902,10 +1912,16 @@ equuleus_glink_probe(void)
+ 			result = mi8_glink_start(g);
+ 			if (result) { break; }
+ 			started = true;
++			if (mss_servreg_test) {
++				sr_started = equuleus_servreg_start(&sr, mi8_glink_qrtr_ops(g), eq_servreg_log, NULL) == 0;
++				if (!sr_started) { result = EIO; break; }
++			}
+ 		}
+ 		if (started) {
+ 			mi8_glink_poll_once(g);
+ 			if (io.fault) { result = EFAULT; break; }
++			if (sr_started) { equuleus_servreg_poll(&sr, now_us()); }
++			if (io.fault) { result = EFAULT; break; }
+ 		}
+ 		delay_for_interval(500, NSEC_PER_USEC);
+ 	}
+@@ -1915,6 +1931,10 @@ equuleus_glink_probe(void)
+ 		for (int i = 0; i < n; i++) {
+ 			say("eqgl: service %u version %u instance %u node %u port %u\n", servers[i].service, servers[i].version, servers[i].instance, servers[i].node, servers[i].port);
+ 		}
++		if (sr_started) {
++			say("eqsr: summary registered=%u up=%u state=%#x attempts=%u sends=%u notifications=%u ack_ok=%u rejected=%u pending=%u\n", sr.registered, sr.up, sr.state, sr.attempts, sr.sends, sr.notifications, sr.acknowledgements, sr.rejected, sr.count + (sr.ack_txn != 0));
++			equuleus_servreg_stop(&sr);
++		}
+ 		mi8_glink_destroy(g);
+ 	} else { say("eqgl: transport not started result=%d (items478/479/480 required)\n", result); }
+ 	say("eqgl: bounded probe ended; existing cooperative stop/halt guard follows\n");
+@@ -2325,19 +2345,20 @@ equuleus_mss_probe(void)
+         !PE_parse_boot_argn("sweetmss", &mode, sizeof(mode)) || mode == 0) {
+         return;
+     }
+-    if (mode != 1 && mode != 2 && mode != 5 && mode != 6 && mode != 7 && mode != 8) {
+-        say("eqmss: supported sweetmss modes: 1 survey, 2 rails/clocks, 5 MBA only, 6 MPSS/SMP2P, 7 MPSS with explicit HALT on all ports, 8 GLINK/QRTR probe\n");
++    if (mode != 1 && mode != 2 && mode != 5 && mode != 6 && mode != 7 && mode != 8 && mode != 9) {
++        say("eqmss: supported sweetmss modes: 1 survey, 2 rails/clocks, 5 MBA only, 6 MPSS/SMP2P, 7 MPSS with explicit HALT on all ports, 8 GLINK/QRTR probe, 9 servreg listener\n");
+         return;
+     }
+     entered = true;
+-    say("eqmss: port 0153, mode %u; bounded GLINK only in mode8; no Wi-Fi or host file services\n", mode);
++    say("eqmss: port 0154, mode %u; GLINK mode8/9, servreg mode9; no Wi-Fi or host file services\n", mode);
+     mss_w2a();
+     if (mode == 2) {
+         mss_w2bc(2);
+-    } else if (mode == 5 || mode == 6 || mode == 7 || mode == 8) {
++    } else if (mode == 5 || mode == 6 || mode == 7 || mode == 8 || mode == 9) {
+         mss_halt_all = mode == 7;
+-        mss_full_test = mode == 6 || mode == 7 || mode == 8;
+-        mss_glink_test = mode == 8;
++        mss_full_test = mode == 6 || mode == 7 || mode == 8 || mode == 9;
++        mss_glink_test = mode == 8 || mode == 9;
++        mss_servreg_test = mode == 9;
+         say("eqmss: explicit AXI HALT on all ports: %u\n", mss_halt_all ? 1u : 0u);
+         mss_run_mba();
+     }
+diff --git a/bsd/dev/equuleus_servreg.c b/bsd/dev/equuleus_servreg.c
+new file mode 100644
+index 0000000..89cc8a7
+--- /dev/null
++++ b/bsd/dev/equuleus_servreg.c
+@@ -0,0 +1,156 @@
++/* SPDX-License-Identifier: APSL-2.0
++ * Service-notifier wire protocol adapted from yanei's dipper-xnu
++ * mi8_rproc.c, commit 4e82c709ea42ebb509fa101b52972fdc890b873e.
++ * Equuleus: strict frames/TLVs, peer and transaction checks, bounded retries,
++ * queued notification ACKs, endpoint removal and state-down handling.
++ * See docs/EQUULEUS_SERVREG.md and docs/licenses/APSL-2.0.txt.
++ */
++#include "equuleus_servreg.h"
++#define SR_UP 0x1fffffffu
++#define SR_REGISTER 0x20u
++#define SR_INDICATION 0x22u
++#define SR_ACK 0x23u
++#define SR_TIMEOUT 2000000ull
++static const uint8_t sr_path[] = "msm/modem/wlan_pd";
++static uint16_t sr_u16(const uint8_t *p) { return (uint16_t)(p[0] | (uint16_t)p[1] << 8); }
++static uint32_t sr_u32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1]<<8 | (uint32_t)p[2]<<16 | (uint32_t)p[3]<<24; }
++static void sr_put16(uint8_t *p, uint16_t v) { p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); }
++static void sr_log(struct equuleus_servreg *s, const char *event, uint32_t a, uint32_t b) {
++ if (s->log) s->log(s->ctx,event,a,b);
++}
++static void sr_clear(struct equuleus_servreg *s) {
++ s->bound=false; s->registered=false; s->up=false; s->state=0;
++ s->reg_txn=0; s->ack_txn=0; s->count=0; s->have_notification=false;
++ s->generation++;
++ /* Keep send/attempt budgets and serial across endpoint changes. */
++}
++static void sr_server(void *ctx, bool arrived, uint32_t service, uint32_t version,
++ uint32_t instance, uint32_t node, uint32_t port) {
++ struct equuleus_servreg *s=ctx;
++ if (service!=66 || version!=1 || instance!=180 || !port || port>=0xfffffffeu) return;
++ if (!arrived) {
++  if (s->bound && s->node==node && s->remote==port) {
++   sr_clear(s); sr_log(s,"service removed",node,port);
++  }
++ } else if (!s->bound) {
++  sr_clear(s); s->node=node; s->remote=port; s->bound=true; s->retry_at=s->now;
++  sr_log(s,"service found",node,port);
++ }
++}
++static void sr_receive(void *ctx, uint32_t node, uint32_t port, const void *data, size_t length) {
++ struct equuleus_servreg *s=ctx;
++ const uint8_t *d=data, *values[17]={0};
++ uint8_t seen[32]={0};
++ uint16_t sizes[17]={0}, txn, msg;
++ size_t at;
++ if (!s->bound || s->node!=node || s->remote!=port || !d || length<7 || length>256) goto invalid;
++ if ((size_t)sr_u16(d+5)+7!=length) goto invalid;
++ txn=sr_u16(d+1); msg=sr_u16(d+3);
++ for (at=7; at<length;) {
++  unsigned type; uint16_t n;
++  if (length-at<3) goto invalid;
++  type=d[at]; n=sr_u16(d+at+1); at+=3;
++  if ((size_t)n>length-at || (seen[type/8] & (1u<<(type%8)))) goto invalid;
++  seen[type/8] |= (uint8_t)(1u<<(type%8));
++  if (type<17) { values[type]=d+at; sizes[type]=n; }
++  at+=n;
++ }
++ if (d[0]==2 && (msg==SR_REGISTER || msg==SR_ACK)) {
++  uint16_t pending=msg==SR_REGISTER?s->reg_txn:s->ack_txn;
++  if (!pending || txn!=pending || !values[2] || sizes[2]!=4) goto invalid;
++  if (values[0x10] && sizes[0x10]!=4) goto invalid;
++  uint16_t result=sr_u16(values[2]), error=sr_u16(values[2]+2);
++  sr_log(s,msg==SR_REGISTER?"register response":"ack response",result,error);
++  if (msg==SR_REGISTER) {
++   s->reg_txn=0; s->registered=(result==0 && error==0);
++   if (s->registered && values[0x10] && !s->have_notification) {
++    s->state=sr_u32(values[0x10]); s->up=s->state==SR_UP;
++    sr_log(s,"current state",s->state,s->up);
++   }
++  } else {
++   s->ack_txn=0;
++   if (!result && !error) s->acknowledgements++;
++  }
++  return;
++ }
++ if (d[0]==4 && msg==SR_INDICATION) {
++  if (!s->attempts || !values[1] || sizes[1]!=4 || !values[2] ||
++      sizes[2]!=sizeof(sr_path)-1 || !values[3] || sizes[3]!=2) goto invalid;
++  for (unsigned i=0; i<sizeof(sr_path)-1; i++) if (values[2][i]!=sr_path[i]) goto invalid;
++  uint16_t notification=sr_u16(values[3]);
++  bool queued=false;
++  for (unsigned i=0;i<s->count;i++) if (s->queue[i]==notification) queued=true;
++  if (!queued && s->count==8) { sr_log(s,"ack queue full",notification,0); goto invalid; }
++  if (!queued) s->queue[s->count++]=notification;
++  s->state=sr_u32(values[1]); s->up=s->state==SR_UP;
++  s->have_notification=true; s->notifications++;
++  sr_log(s,"notification state",s->state,notification);
++  return;
++ }
++invalid:
++ s->rejected++;
++}
++static unsigned sr_tlv(uint8_t *p, unsigned at, uint8_t type, const uint8_t *v, unsigned n) {
++ p[at]=type; sr_put16(p+at+1,(uint16_t)n);
++ for (unsigned i=0;i<n;i++) p[at+3+i]=v[i];
++ return at+3+n;
++}
++static uint16_t sr_next(struct equuleus_servreg *s) {
++ if (++s->serial==0) ++s->serial;
++ return s->serial;
++}
++static void sr_send(struct equuleus_servreg *s, bool ack) {
++ uint8_t p[64]={0}, one=1, transaction[2]; unsigned n=7;
++ uint16_t txn=sr_next(s); uint32_t generation=s->generation;
++ sr_put16(p+1,txn); sr_put16(p+3,ack?SR_ACK:SR_REGISTER);
++ if (ack) {
++  sr_put16(transaction,s->queue[0]);
++  for (unsigned i=1;i<s->count;i++) s->queue[i-1]=s->queue[i];
++  s->count--;
++  n=sr_tlv(p,n,1,sr_path,sizeof(sr_path)-1);
++  n=sr_tlv(p,n,2,transaction,2);
++  s->ack_txn=txn; s->ack_at=s->now;
++ } else {
++  n=sr_tlv(p,n,1,&one,1);
++  n=sr_tlv(p,n,2,sr_path,sizeof(sr_path)-1);
++  s->reg_txn=txn; s->reg_at=s->now; s->retry_at=s->now+SR_TIMEOUT; s->attempts++;
++ }
++ sr_put16(p+5,(uint16_t)(n-7)); s->sends++;
++ /* Establish pending transaction BEFORE send: it can deliver callbacks. */
++ int result=s->ops->send(s->port,s->node,s->remote,p,n);
++ sr_log(s,ack?"ack sent":"register sent",txn,(uint32_t)result);
++ if (result && s->generation==generation) {
++  if (ack && s->ack_txn==txn) s->ack_txn=0;
++  if (!ack && s->reg_txn==txn) s->reg_txn=0;
++ }
++}
++int equuleus_servreg_start(struct equuleus_servreg *s, const struct redwood_qrtr_ops *ops,
++ void (*log)(void *, const char *, uint32_t, uint32_t), void *ctx) {
++ if (!s || !ops || !ops->open || !ops->send || !ops->lookup || !ops->close || s->port) return -1;
++ s->ops=ops; s->log=log; s->ctx=ctx;
++ s->port=ops->open(sr_receive,sr_server,s);
++ if (!s->port) return -1;
++ int result=ops->lookup(s->port,66,1,180);
++ sr_log(s,"lookup",66,(uint32_t)result);
++ if (result) { equuleus_servreg_stop(s); return result; }
++ return 0;
++}
++void equuleus_servreg_poll(struct equuleus_servreg *s, uint64_t now) {
++ if (!s || !s->port) return;
++ s->now=now;
++ if (!s->bound) return;
++ if (s->reg_txn && now-s->reg_at>=SR_TIMEOUT) {
++  sr_log(s,"register timeout",s->reg_txn,0); s->reg_txn=0;
++ }
++ if (s->ack_txn && now-s->ack_at>=SR_TIMEOUT) {
++  sr_log(s,"ack timeout",s->ack_txn,0); s->ack_txn=0;
++ }
++ if (s->sends>=32) return;
++ if (s->count && !s->ack_txn) sr_send(s,true);
++ else if (!s->registered && !s->reg_txn && s->attempts<5 && now>=s->retry_at) sr_send(s,false);
++}
++void equuleus_servreg_stop(struct equuleus_servreg *s) {
++ if (!s) return;
++ if (s->port) s->ops->close(s->port);
++ s->port=0; sr_clear(s);
++}
+diff --git a/bsd/dev/equuleus_servreg.h b/bsd/dev/equuleus_servreg.h
+new file mode 100644
+index 0000000..32d6f9b
+--- /dev/null
++++ b/bsd/dev/equuleus_servreg.h
+@@ -0,0 +1,26 @@
++/* SPDX-License-Identifier: APSL-2.0
++ * Service-notifier protocol adapted from dipper-xnu mi8_rproc.c,
++ * 4e82c709ea42ebb509fa101b52972fdc890b873e (yanei and contributors).
++ * See docs/EQUULEUS_SERVREG.md and docs/licenses/APSL-2.0.txt.
++ */
++#ifndef EQUULEUS_SERVREG_H
++#define EQUULEUS_SERVREG_H
++#include "equuleus_glink.h"
++struct equuleus_servreg {
++ const struct redwood_qrtr_ops *ops;
++ struct redwood_qrtr_port *port;
++ void (*log)(void *, const char *, uint32_t, uint32_t);
++ void *ctx;
++ uint32_t node, remote, generation, state;
++ uint16_t serial, reg_txn, ack_txn, queue[8];
++ unsigned count, attempts, sends, rejected, notifications, acknowledgements;
++ uint64_t now, retry_at, reg_at, ack_at;
++ bool bound, registered, up, have_notification;
++};
++/* Single polling thread; callbacks may run synchronously inside ops calls.
++ * Start on a zeroed object; stop before destroying its GLINK instance. */
++int equuleus_servreg_start(struct equuleus_servreg *, const struct redwood_qrtr_ops *,
++ void (*)(void *, const char *, uint32_t, uint32_t), void *);
++void equuleus_servreg_poll(struct equuleus_servreg *, uint64_t);
++void equuleus_servreg_stop(struct equuleus_servreg *);
++#endif

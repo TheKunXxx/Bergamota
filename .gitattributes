@@ -9,3 +9,4 @@ xnu/patches/0150-equuleus-mpss-smp2p-bringup.patch -whitespace
 xnu/patches/0151-equuleus-mpss-stop-diagnostics.patch -whitespace
 xnu/patches/0152-equuleus-explicit-axi-halt.patch -whitespace
 xnu/patches/0153-equuleus-glink-qrtr-probe.patch -whitespace
+xnu/patches/0154-equuleus-servreg-listener.patch -whitespace
