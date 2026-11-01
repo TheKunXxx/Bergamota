@@ -3,7 +3,8 @@
 from pathlib import Path
 import subprocess,tempfile,os
 repo=Path(__file__).resolve().parents[2]
-tftp_replace=bool(os.environ.get('EQUULEUS_TEST_0159'))
+firmware_paths=bool(os.environ.get('EQUULEUS_TEST_0160'))
+tftp_replace=firmware_paths or bool(os.environ.get('EQUULEUS_TEST_0159'))
 tftp_ram=tftp_replace or bool(os.environ.get('EQUULEUS_TEST_0158'))
 rmtfs=tftp_ram or bool(os.environ.get('EQUULEUS_TEST_0157'))
 hostsvc=rmtfs or bool(os.environ.get('EQUULEUS_TEST_0155'))
@@ -15,7 +16,7 @@ with tempfile.TemporaryDirectory() as td:
  conf=root/'bsd/conf/files';conf.parent.mkdir(parents=True)
  conf.write_text(''.join('fixture/prefix%u.c\tstandard\n' % i for i in range(117))+'bsd/dev/beryllium_wlan.c\t\tstandard\nbsd/dev/equuleus_mss.c\t\tstandard\nbsd/dev/beryllium_bt_hci.c\t\tstandard\n'+''.join('fixture/suffix%u.c\tstandard\n' % i for i in range(12)))
  subprocess.run(['git','init','-q',td],check=True)
- for prefix in ['0150','0151','0152','0153']+(['0154'] if servreg else [])+(['0155'] if hostsvc else [])+(['0156','0157'] if rmtfs else [])+(['0158'] if tftp_ram else [])+(['0159'] if tftp_replace else []):
+ for prefix in ['0150','0151','0152','0153']+(['0154'] if servreg else [])+(['0155'] if hostsvc else [])+(['0156','0157'] if rmtfs else [])+(['0158'] if tftp_ram else [])+(['0159'] if tftp_replace else [])+(['0160'] if firmware_paths else []):
   patch=next((repo/'xnu/patches').glob(prefix+'-*'))
   subprocess.run(['git','apply','--check',str(patch)],cwd=root,check=True)
   subprocess.run(['git','apply',str(patch)],cwd=root,check=True)
@@ -175,12 +176,14 @@ static bool assign_mem(const char *name,uint32_t pa,uint32_t n,uint64_t *owners,
  uint64_t part_size;assert(!eq_rmt_part_size(NULL,"modemst1",&part_size));uint8_t b;assert(!eq_rmt_part_read(NULL,"modemst1",0,&b,1));
  mss_rmtfs_test=true;mss_rmtfs=NULL;elapsed=0;equuleus_glink_probe();assert(elapsed<=60000000ull && !mss_rmt_share_attempted);mss_rmtfs_test=false;
 ''')
+ if firmware_paths:
+  prefix+='\n#define MIN(a,b) ((a)<(b)?(a):(b))\n'+source[source.index('static bool\nfs_component83('):source.index('/* Bounded nested FAT16 lookup;')]
  c=dev/'adapter.c';c.write_text(prefix+adapter+main)
  subprocess.run(['cc','-std=gnu11','-DMI8_GLINK_HOST_TEST','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-pthread',str(c),str(dev/'equuleus_glink.c'),*([str(dev/'equuleus_servreg.c')] if servreg else []),*([str(dev/'mi8_hostsvc.c')] if hostsvc else []),*(['-DEQ_RMTFS_HOST_TEST',str(dev/'equuleus_rmtfs.c')] if rmtfs else []),'-o',str(exe)],check=True)
  subprocess.run([str(exe)],check=True,env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0'})
  print('Actual equuleus adapter: bounded probe, missing/overlapping/out-of-range items, fatal DSP, read failure and write allowlist checks passed')
  if rmtfs:
-  print(('0159' if tftp_replace else '0158' if tftp_ram else '0157')+' actual modified GLINK adapter compiled and checked: bounds, deadline and missing-prepared-RMTFS refusal')
+  print(('0160' if firmware_paths else '0159' if tftp_replace else '0158' if tftp_ram else '0157')+' actual modified GLINK adapter compiled and checked: bounds, deadline and missing-prepared-RMTFS refusal')
   raise SystemExit(0)
  gate=source[source.index('void\nequuleus_mss_probe(void)'):].split('#endif',1)[0]
  prefix=r'''
