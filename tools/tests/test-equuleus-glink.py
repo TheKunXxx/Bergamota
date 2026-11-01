@@ -3,7 +3,8 @@
 from pathlib import Path
 import subprocess,tempfile,os
 repo=Path(__file__).resolve().parents[2]
-deep_mcfg=bool(os.environ.get('EQUULEUS_TEST_0161'))
+probe_progress=bool(os.environ.get('EQUULEUS_TEST_0162'))
+deep_mcfg=probe_progress or bool(os.environ.get('EQUULEUS_TEST_0161'))
 firmware_paths=deep_mcfg or bool(os.environ.get('EQUULEUS_TEST_0160'))
 tftp_replace=firmware_paths or bool(os.environ.get('EQUULEUS_TEST_0159'))
 tftp_ram=tftp_replace or bool(os.environ.get('EQUULEUS_TEST_0158'))
@@ -17,7 +18,7 @@ with tempfile.TemporaryDirectory() as td:
  conf=root/'bsd/conf/files';conf.parent.mkdir(parents=True)
  conf.write_text(''.join('fixture/prefix%u.c\tstandard\n' % i for i in range(117))+'bsd/dev/beryllium_wlan.c\t\tstandard\nbsd/dev/equuleus_mss.c\t\tstandard\nbsd/dev/beryllium_bt_hci.c\t\tstandard\n'+''.join('fixture/suffix%u.c\tstandard\n' % i for i in range(12)))
  subprocess.run(['git','init','-q',td],check=True)
- for prefix in ['0150','0151','0152','0153']+(['0154'] if servreg else [])+(['0155'] if hostsvc else [])+(['0156','0157'] if rmtfs else [])+(['0158'] if tftp_ram else [])+(['0159'] if tftp_replace else [])+(['0160'] if firmware_paths else [])+(['0161'] if deep_mcfg else []):
+ for prefix in ['0150','0151','0152','0153']+(['0154'] if servreg else [])+(['0155'] if hostsvc else [])+(['0156','0157'] if rmtfs else [])+(['0158'] if tftp_ram else [])+(['0159'] if tftp_replace else [])+(['0160'] if firmware_paths else [])+(['0161'] if deep_mcfg else [])+(['0162'] if probe_progress else []):
   patch=next((repo/'xnu/patches').glob(prefix+'-*'))
   subprocess.run(['git','apply','--check',str(patch)],cwd=root,check=True)
   subprocess.run(['git','apply',str(patch)],cwd=root,check=True)
@@ -77,9 +78,15 @@ int main(void) {
  assert(allocs==0);return 0;
 }
 '''
+ if probe_progress:
+  harness=harness.replace('static struct mi8_glink *fresh(void)', 'static unsigned intent_logs,error_logs;\nstatic void testlog(void *c,const char *f,...) {(void)c;if(strstr(f,"remote intent id"))intent_logs++;if(strstr(f,"GLINK error"))error_logs++;}\nstatic struct mi8_glink *fresh(void)')
+  harness=harness.replace('.now_us=now};', '.now_us=now,.log=testlog,.quiet_data=getenv("EQ_QUIET")!=NULL};')
+  harness=harness.replace('qrtr(g,Q_HELLO,0);', 'assert(intent_logs==(getenv("EQ_QUIET")?0u:1u));qrtr(g,Q_HELLO,0);')
+  harness=harness.replace('assert(allocs==0);return 0;', 'assert(allocs==0 && error_logs>0);return 0;')
  c=dev/'test.c';c.write_text(harness);exe=root/'test'
  subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-pthread',str(c),'-o',str(exe)],check=True)
  subprocess.run([str(exe)],check=True,env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0'})
+ if probe_progress: subprocess.run([str(exe)],check=True,env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0','EQ_QUIET':'1'})
  assert ('mss_glink_test = mode == 8 || mode == 9 || mode == 10 || mode == 12;' if rmtfs else 'mss_glink_test = mode == 8 || mode == 9 || mode == 10;' if hostsvc else 'mss_glink_test = mode == 8 || mode == 9;' if servreg else 'mss_glink_test = mode == 8;') in source
  assert source.index('equuleus_glink_probe();') < source.index('done:\n\t(void)dsp_ask_to_stop',source.index('equuleus_glink_probe();'))
  adapter=source[source.index('/* 0153:'):source.index('#define MAX_SEGMENTS 48u')]
@@ -177,6 +184,12 @@ static bool assign_mem(const char *name,uint32_t pa,uint32_t n,uint64_t *owners,
  uint64_t part_size;assert(!eq_rmt_part_size(NULL,"modemst1",&part_size));uint8_t b;assert(!eq_rmt_part_read(NULL,"modemst1",0,&b,1));
  mss_rmtfs_test=true;mss_rmtfs=NULL;elapsed=0;equuleus_glink_probe();assert(elapsed<=60000000ull && !mss_rmt_share_attempted);mss_rmtfs_test=false;
 ''')
+ if probe_progress:
+  main=main.replace('elapsed<=60000000ull','elapsed<=180000000ull')
+  prefix=prefix.replace('static void delay_for_interval(unsigned n,unsigned unit)', 'static bool test_spin;\nstatic void delay_for_interval(unsigned n,unsigned unit)').replace('elapsed+=n;}', 'if(!test_spin)elapsed+=n;}')
+  main=main.replace('mss_rmtfs_test=false;', 'mss_rmtfs_test=false;scenario=1;mss_rmtfs_test=true;test_spin=true;elapsed=0;equuleus_glink_probe();assert(strstr(exit_log,"reason=poll-cap"));test_spin=false;mss_rmtfs_test=false;')
+  prefix=prefix.replace('static void say(const char *f,...) {(void)f;}', 'static char exit_log[256];static unsigned exit_count;\nstatic void say(const char *f,...) {if(strstr(f,"eqgl: exit reason=")){va_list a;va_start(a,f);vsnprintf(exit_log,sizeof(exit_log),f,a);va_end(a);exit_count++;}}')
+  main=main.replace('if(scenario==1 || scenario==2 || scenario==3)assert(writes==0 && bells==0);', 'assert(exit_count && strstr(exit_log,"elapsed_us="));if(scenario==1 || scenario==2 || scenario==3){assert(writes==0 && bells==0);assert(strstr(exit_log,"reason=deadline"));}if(scenario==4)assert(strstr(exit_log,"reason=dsp-fault"));')
  if firmware_paths:
   prefix+='\n#define MIN(a,b) ((a)<(b)?(a):(b))\n'+source[source.index('static bool\nfs_component83('):source.index('/* Bounded nested FAT16 lookup;')]
  c=dev/'adapter.c';c.write_text(prefix+adapter+main)
@@ -184,7 +197,7 @@ static bool assign_mem(const char *name,uint32_t pa,uint32_t n,uint64_t *owners,
  subprocess.run([str(exe)],check=True,env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0'})
  print('Actual equuleus adapter: bounded probe, missing/overlapping/out-of-range items, fatal DSP, read failure and write allowlist checks passed')
  if rmtfs:
-  print(('0161' if deep_mcfg else '0160' if firmware_paths else '0159' if tftp_replace else '0158' if tftp_ram else '0157')+' actual modified GLINK adapter compiled and checked: bounds, deadline and missing-prepared-RMTFS refusal')
+  print(('0162' if probe_progress else '0161' if deep_mcfg else '0160' if firmware_paths else '0159' if tftp_replace else '0158' if tftp_ram else '0157')+' actual modified GLINK adapter compiled and checked: bounds, deadline and missing-prepared-RMTFS refusal')
   raise SystemExit(0)
  gate=source[source.index('void\nequuleus_mss_probe(void)'):].split('#endif',1)[0]
  prefix=r'''

@@ -1,0 +1,280 @@
+diff --git a/bsd/dev/equuleus_glink.c b/bsd/dev/equuleus_glink.c
+index 34a43be..bc6d513 100644
+--- a/bsd/dev/equuleus_glink.c
++++ b/bsd/dev/equuleus_glink.c
+@@ -422,7 +422,7 @@ progress(struct mi8_glink *g)
+ 			}
+ 			g->foreign[best].busy = true;
+ 			o->iid = g->foreign[best].id;
+-			if (o->length > 1000) LOG(g, "mi8gl: sends %u bytes in remote intent %u (size %u)\n", o->length, o->iid, g->foreign[best].size);
++			if (!g->cfg.quiet_data && o->length > 1000) LOG(g, "mi8gl: sends %u bytes in remote intent %u (size %u)\n", o->length, o->iid, g->foreign[best].size);
+ 		}
+ 		available = room(g, true);
+ 		if (available < 24) { notify(g); return; }
+@@ -656,7 +656,7 @@ pump(struct mi8_glink *g)
+ 				peek(g, tail, 8 + 8 * i, extra, 8);
+ 				size = get32(extra); id = get32(extra + 4);
+ 				/* Linux does not refuse these: the modem's firmware numbers its intents from 0 (EXP-0200); a zero size is of no use, skip it */
+-				LOG(g, "mi8gl: remote intent id %u size %u (%s)\n", id, size, g->cfg.name);
++				if (!g->cfg.quiet_data) LOG(g, "mi8gl: remote intent id %u size %u (%s)\n", id, size, g->cfg.name);
+ 				if (!size) continue;
+ 				for (j = 0; j < INTENTS; j++) if (g->foreign[j].there && g->foreign[j].id == id) break;
+ 				if (j < INTENTS) {
+@@ -729,14 +729,14 @@ pump(struct mi8_glink *g)
+ 		case INTENT_ACK:
+ 			if (cid == g->remote && g->outgoing && g->outgoing->requested) {
+ 				g->outgoing->answered = true; g->outgoing->granted = arg != 0;
+-				if (g->outgoing->length > 1000) LOG(g, "mi8gl: the modem %s the intent request for %u bytes\n", arg ? "grants" : "REFUSES", g->outgoing->length);
++				if ((!g->cfg.quiet_data || !arg) && g->outgoing->length > 1000) LOG(g, "mi8gl: the modem %s the intent request for %u bytes\n", arg ? "grants" : "REFUSES", g->outgoing->length);
+ 			}
+ 			break;
+ 		case DONE:
+ 		case DONE_REUSE:
+ 			if (cid == g->remote) for (i = 0; i < INTENTS; i++) if (g->foreign[i].there && g->foreign[i].id == arg) {
+ 				/* The modem can answer before emit() has returned and offset has been counted (it is quick, EXP-0200): not an error. */
+-				if (g->foreign[i].size > 1000) LOG(g, "mi8gl: remote done with intent %u (size %u), %s\n", arg, g->foreign[i].size, cmd == DONE_REUSE ? "reusable" : "gone");
++				if (!g->cfg.quiet_data && g->foreign[i].size > 1000) LOG(g, "mi8gl: remote done with intent %u (size %u), %s\n", arg, g->foreign[i].size, cmd == DONE_REUSE ? "reusable" : "gone");
+ 				g->foreign[i].busy = false;
+ 				g->foreign[i].there = cmd == DONE_REUSE;
+ 				break;
+diff --git a/bsd/dev/equuleus_glink.h b/bsd/dev/equuleus_glink.h
+index ecd10ed..d8ac417 100644
+--- a/bsd/dev/equuleus_glink.h
++++ b/bsd/dev/equuleus_glink.h
+@@ -51,6 +51,7 @@ struct mi8_glink_cfg {
+ 	void (*sleep_us)(void *, uint32_t);
+ 	uint64_t (*now_us)(void *);
+ 	void (*log)(void *, const char *, ...);
++	bool quiet_data; /* Suppress successful per-packet chatter, retain errors/control. */
+ 	void *ctx;
+ 	uint32_t local_node; /* Zero selects the default node 1. */
+ };
+diff --git a/bsd/dev/equuleus_mss.c b/bsd/dev/equuleus_mss.c
+index 0f385a0..7b92193 100644
+--- a/bsd/dev/equuleus_mss.c
++++ b/bsd/dev/equuleus_mss.c
+@@ -2023,34 +2023,35 @@ equuleus_glink_probe(void)
+ 	struct equuleus_servreg sr;
+ 	struct mi8_hostsvc *hs = NULL;
+ 	bool sr_started = false;
+-	uint64_t budget = mss_rmtfs_test ? 60000000ull : mss_hostsvc_test ? 30000000ull : (mss_servreg_test ? 20000000ull : 10000000ull);
++	uint64_t budget = mss_rmtfs_test ? 180000000ull : mss_hostsvc_test ? 30000000ull : (mss_servreg_test ? 20000000ull : 10000000ull);
+ 	struct mi8_glink_cfg cfg;
+ 	struct mi8_glink *g = NULL;
+ 	struct mi8_qrtr_server servers[64];
+ 	uint64_t began = now_us();
+ 	bool started = false;
+ 	int result = ENOENT;
++	unsigned poll=0; const char *reason=NULL;
+ 
+ 	say("eqgl: bounded GLINK/QRTR; servreg=%u budget_us=%llu; firmware_services=%u\n", mss_servreg_test ? 1u : 0u, budget, mss_hostsvc_test ? 1u : 0u);
+ 	bzero(&sr, sizeof(sr));
+ 	bzero(&io, sizeof(io)); bzero(&cfg, sizeof(cfg));
+-	for (unsigned poll = 0; poll < (mss_rmtfs_test ? 120000u : mss_hostsvc_test ? 60000u : (mss_servreg_test ? 40000u : 20000u)) && now_us() - began < budget; poll++) {
++	for (; poll < (mss_rmtfs_test ? 360000u : mss_hostsvc_test ? 60000u : (mss_servreg_test ? 40000u : 20000u)) && now_us() - began < budget; poll++) {
+ 		if (poll % 200 == 0) {
+ 			struct smp2p state;
+-			if (!dsp_words(&state) || (dsp_state(&state) & DSP_FATAL)) { result = EIO; break; }
++			if (!dsp_words(&state) || (dsp_state(&state) & DSP_FATAL)) { result = EIO; reason="dsp-fault"; break; }
+ 			dsp_listen(&state);
+ 		}
+ 		if (!started && eq_glink_layout(&io)) {
+ 			cfg.name = "equuleus-modem"; cfg.remote_pid = SMEM_MODEM; cfg.ctx = &io;
+ 			cfg.smem_item = eq_glink_item; cfg.smem_read = eq_glink_read; cfg.smem_write32 = eq_glink_write;
+-			cfg.ring = eq_glink_ring; cfg.sleep_us = eq_glink_sleep; cfg.now_us = eq_glink_now; cfg.log = eq_glink_log;
++			cfg.ring = eq_glink_ring; cfg.sleep_us = eq_glink_sleep; cfg.now_us = eq_glink_now; cfg.log = eq_glink_log; cfg.quiet_data=mss_rmtfs_test;
+ 			g = mi8_glink_create(&cfg);
+-			if (!g) { result = ENOMEM; break; }
++			if (!g) { result = ENOMEM; reason="allocation"; break; }
+ 			say("eqgl: items desc %#x/%u tx %#x/%u rx %#x/%u\n", io.base[0], io.size[0], io.base[1], io.size[1], io.base[2], io.size[2]);
+ 			result = mi8_glink_start(g);
+-			if (result) { break; }
++			if (result) { reason="transport-start"; break; }
+ 			started = true;
+-            if (mss_rmtfs_test && !eq_rmt_share_start(g)) { result=EIO; break; }
++            if (mss_rmtfs_test && !eq_rmt_share_start(g)) { result=EIO; reason="rmtfs-start"; break; }
+             if (mss_hostsvc_test) {
+                 struct mi8_hostsvc_cfg hc; bzero(&hc, sizeof(hc));
+                 hc.qrtr=mi8_glink_qrtr_ops(g); hc.publish=eq_host_publish;
+@@ -2059,26 +2060,28 @@ equuleus_glink_probe(void)
+                 hc.ram_writes=mss_rmtfs_test ? 1u : 0u;
+                 hc.domains=eq_domains; hc.n_domains=2; hc.ctx=g; hc.log=eq_glink_log;
+                 hs=mi8_hostsvc_create(&hc);
+-                if (!hs || mi8_hostsvc_start(hs)) { result=EIO; break; }
++                if (!hs || mi8_hostsvc_start(hs)) { result=EIO; reason="host-services"; break; }
+                 say("eqhs: firmware services64/4096 enabled; RMTFS14=%u; no NV writes\n",mss_rmtfs_test?1u:0u);
+             }
+ 			if (mss_servreg_test) {
+ 				sr_started = equuleus_servreg_start(&sr, mi8_glink_qrtr_ops(g), eq_servreg_log, NULL) == 0;
+-				if (!sr_started) { result = EIO; break; }
++				if (!sr_started) { result = EIO; reason="servreg-start"; break; }
+ 			}
+ 		}
+ 		if (started) {
+ 			mi8_glink_poll_once(g);
+-			if (io.fault) { result = EFAULT; break; }
++			if (io.fault) { result = EFAULT; reason="io-fault"; break; }
+ 			if (mss_rmtfs_test) { equuleus_rmtfs_poll(mss_rmtfs); }
+-			if (io.fault) { result=EFAULT; break; }
++			if (io.fault) { result=EFAULT; reason="io-fault"; break; }
+ 			if (hs && now_us()-began<budget) { mi8_hostsvc_poll(hs); }
+-			if (io.fault) { result = EFAULT; break; }
++			if (io.fault) { result = EFAULT; reason="io-fault"; break; }
+ 			if (sr_started && now_us() - began < budget) { equuleus_servreg_poll(&sr, now_us()); }
+-			if (io.fault) { result = EFAULT; break; }
++			if (io.fault) { result = EFAULT; reason="io-fault"; break; }
+ 		}
+ 		delay_for_interval(500, NSEC_PER_USEC);
+ 	}
++	if (!reason) reason=now_us()-began>=budget?"deadline":"poll-cap";
++	say("eqgl: exit reason=%s elapsed_us=%llu polls=%u budget_us=%llu\n",reason,(unsigned long long)(now_us()-began),poll,(unsigned long long)budget);
+ 	if (g) {
+ 		int n = mi8_glink_qrtr_servers(g, servers, 64);
+ 		say("eqgl: transport start=%u result=%d io_fault=%u servers=%d\n", started ? 1u : 0u, result, io.fault ? 1u : 0u, n);
+@@ -2587,7 +2590,7 @@ equuleus_mss_probe(void)
+     if (mode == 11) { equuleus_rmtfs_preflight(); return; }
+     mss_rmtfs_test = mode == 12;
+     if (mss_rmtfs_test && !equuleus_rmtfs_prepare()) { say("eqrf: prepare refused; full reboot required\n"); return; }
+-    say("eqmss: port 0161, mode %u; GLINK mode8/9/10/12, servreg mode9/10/12, firmware services mode10/12; no Wi-Fi\n", mode);
++    say("eqmss: port 0162, mode %u; GLINK mode8/9/10/12, servreg mode9/10/12, firmware services mode10/12; no Wi-Fi\n", mode);
+     mss_w2a();
+     if (mode == 2) {
+         mss_w2bc(2);
+diff --git a/bsd/dev/mi8_hostsvc.c b/bsd/dev/mi8_hostsvc.c
+index 9d7b94b..78b3132 100644
+--- a/bsd/dev/mi8_hostsvc.c
++++ b/bsd/dev/mi8_hostsvc.c
+@@ -64,6 +64,7 @@ enum { LOG_OPEN, LOG_ALLOC, LOG_RW, LOG_RRQ, LOG_WRQ, LOG_PDM, LOG_OTHER, LOG_ER
+ #define TFTP_BLOCK 2048u
+ #define TFTP_WINDOW 1u
+ #define QMI_RESPONSE 4096u
++#define TFTP_BUDGET 32768u
+ #define SESSIONS 8
+ #define RAM_FILE_BYTES (2u * 1024u * 1024u)
+ #define RAM_FILES 8
+@@ -109,6 +110,8 @@ struct mi8_hostsvc {
+ 	uint64_t logs[LOG_CLASSES];
+ 	unsigned requests, replies, rejected;
+ 	unsigned received[3], answered[3];
++	unsigned reply_cap_drops, send_errors, no_reply, queue_peak, queue_drops, budget_drops, alloc_drops, rrq_complete;
++	uint64_t data_sent;
+ 	unsigned ram_commits, ram_replacements, ram_readbacks, missing_files;
+ 	struct ram_file files[RAM_FILES];
+ 	struct tftp sessions[SESSIONS];
+@@ -144,6 +147,7 @@ static bool
+ log_due(struct mi8_hostsvc *h, unsigned category)
+ {
+ 	uint64_t n = ++h->logs[category];
++	if (h->cfg.ram_writes && category==LOG_OTHER) return h->cfg.log && (n<=4 || n%1024==0);
+ 	return h->cfg.log && (n <= 20 || n % 20 == 0);
+ }
+ #define LOG(h, category, ...) do { if (log_due(h, category)) (h)->cfg.log((h)->cfg.ctx, __VA_ARGS__); } while (0)
+@@ -236,10 +240,11 @@ text(const uint8_t *p, unsigned n, char *out, unsigned capacity)
+ static int
+ send_reply(struct mi8_hostsvc *h, unsigned endpoint, uint32_t node, uint32_t port, const void *p, unsigned n)
+ {
+-	if (h->cfg.ram_writes ? h->answered[endpoint] >= (endpoint == 1 ? 8192u : 512u) : h->replies >= 128) return HS_IO;
++	if (h->cfg.ram_writes ? h->answered[endpoint] >= (endpoint == 1 ? TFTP_BUDGET : 512u) : h->replies >= 128) { h->reply_cap_drops++; return HS_IO; }
+ 	h->answered[endpoint]++;
+ 	h->replies++;
+ 	int error = h->cfg.qrtr->send(h->endpoints[endpoint].port, node, port, p, n);
++	if (error) h->send_errors++;
+ 	if (error) LOG(h, LOG_ERROR, "mi8hs: ERROR send endpoint=%u errno=%d\n", endpoint, error);
+ 	return error;
+ }
+@@ -438,6 +443,7 @@ tftp_window(struct mi8_hostsvc *h, struct tftp *s)
+ 
+ 			LOG(h, LOG_OTHER, "mi8hs: tftp data block=%llu bytes=%u -> %d\n", (unsigned long long)block, n, r);
+ 			if (r) break;
++			h->data_sent+=n;
+ 		}
+ 		s->sent = block;
+ 	}
+@@ -574,7 +580,7 @@ tftp_request(struct mi8_hostsvc *h, uint32_t node, uint32_t port, const uint8_t
+ 		if (ack > s->sent) return;
+ 		s->acked = ack;
+ 		if (ack == s->final) {
+-			s->done=true;
++			s->done=true; h->rrq_complete++;
+ 			if (s->ram_slot) h->ram_readbacks++;
+ 			LOG(h,LOG_COMPLETE,"mi8hs: RRQ complete file=%s bytes=%llu RAM=%u\n",s->path,(unsigned long long)s->size,s->ram_slot);
+ 		}
+@@ -621,13 +627,17 @@ receive(void *ctx, uint32_t node, uint32_t port, const void *data, size_t n)
+ 	struct mi8_hostsvc *h = e->h;
+ 	struct pending *p;
+ 	if (!h->started) return;
+-	if (node != 0 || !port || port >= 0xfffffffeu || !data || !n || n > MAX_REQUEST || h->queued >= (h->cfg.ram_writes && e->kind==1 ? 6u : 8u) || (h->cfg.ram_writes ? h->received[e->kind] >= (e->kind==1 ? 8192u : 512u) : h->requests >= 128)) { h->rejected++; LOG(h, LOG_ERROR, "mi8hs: ERROR request peer, queue or length\n"); return; }
++	unsigned queue_cap=h->cfg.ram_writes && e->kind==1 ? 6u : 8u;
++	bool budget_hit=h->cfg.ram_writes ? h->received[e->kind]>=(e->kind==1?TFTP_BUDGET:512u) : h->requests>=128;
++	if (h->queued>=queue_cap) h->queue_drops++;
++	if (budget_hit) h->budget_drops++;
++	if (node != 0 || !port || port >= 0xfffffffeu || !data || !n || n > MAX_REQUEST || h->queued >= (h->cfg.ram_writes && e->kind==1 ? 6u : 8u) || (h->cfg.ram_writes ? h->received[e->kind] >= (e->kind==1 ? TFTP_BUDGET : 512u) : h->requests >= 128)) { h->rejected++; LOG(h, LOG_ERROR, "mi8hs: ERROR request peer, queue or length\n"); return; }
+ 	p = MI8_ALLOC(sizeof(*p) + n);
+-	if (!p) { LOG(h, LOG_ERROR, "mi8hs: ERROR request allocation\n"); return; }
++	if (!p) { h->alloc_drops++; LOG(h, LOG_ERROR, "mi8hs: ERROR request allocation\n"); return; }
+ 	p->next = NULL; p->node = node; p->port = port; p->kind = e->kind; p->length = (unsigned)n;
+ 	memcpy(p->bytes, data, n);
+ 	if (h->last) h->last->next = p; else h->first = p;
+-	h->last = p; h->queued++; h->requests++; h->received[e->kind]++;
++	h->last = p; h->queued++; h->requests++; h->received[e->kind]++; if (h->queued>h->queue_peak) h->queue_peak=h->queued;
+ }
+ 
+ void
+@@ -640,8 +650,10 @@ mi8_hostsvc_poll(struct mi8_hostsvc *h)
+ 	h->dispatching = true;
+ 	if ((p = h->first) != NULL) {
+ 		h->first = p->next; if (!h->first) h->last = NULL;
++		unsigned before=h->replies;
+ 		if (p->kind == 1) tftp_request(h, p->node, p->port, p->bytes, p->length);
+ 		else qmi_request(h, p->kind, p->node, p->port, p->bytes, p->length);
++		if (before==h->replies) h->no_reply++;
+ 		h->queued--;
+ 		MI8_FREE(p, sizeof(*p) + p->length);
+ 	}
+@@ -696,6 +708,26 @@ fail:
+ 	return error;
+ }
+ 
++/* Snapshot before freeing queues, sessions or RAM; no sends or mutations. */
++void
++mi8_hostsvc_snapshot(struct mi8_hostsvc *h)
++{
++ if (!h || !h->cfg.log) return;
++ unsigned rrq=0,wrq=0;
++ for (unsigned i=0;i<SESSIONS;i++) {
++  const struct tftp *s=&h->sessions[i];
++  if (!s->live || s->done) continue;
++  if (s->write) wrq++; else rrq++;
++  uint64_t bytes=s->write?h->files[s->ram_slot-1].size:s->sent*s->blocksize;
++  if (!s->write && bytes>s->size) bytes=s->size;
++  h->cfg.log(h->cfg.ctx,"mi8hs: active %s peer=%u:%u file=%s bytes=%llu size=%llu ack=%llu sent=%llu oack=%u\n",
++   s->write?"WRQ":"RRQ",s->node,s->port,s->path,(unsigned long long)bytes,(unsigned long long)s->size,
++   (unsigned long long)s->acked,(unsigned long long)s->sent,s->oack?1u:0u);
++ }
++ h->cfg.log(h->cfg.ctx,"mi8hs: progress rrq_done=%u active_rrq=%u active_wrq=%u queued=%u peak=%u tx_bytes=%llu send_errors=%u no_reply=%u queue_drops=%u budget_drops=%u alloc_drops=%u reply_cap_drops=%u\n",
++  h->rrq_complete,rrq,wrq,h->queued,h->queue_peak,(unsigned long long)h->data_sent,h->send_errors,h->no_reply,h->queue_drops,h->budget_drops,h->alloc_drops,h->reply_cap_drops);
++}
++
+ void
+ mi8_hostsvc_stop(struct mi8_hostsvc *h)
+ {
+@@ -706,6 +738,7 @@ mi8_hostsvc_stop(struct mi8_hostsvc *h)
+ 	for (i = 0; i < 3; i++) if (h->endpoints[i].port) {
+ 		h->cfg.qrtr->close(h->endpoints[i].port); h->endpoints[i].port = NULL;
+ 	}
++	mi8_hostsvc_snapshot(h);
+ 	h->started = false;
+ 	while ((p = h->first) != NULL) { h->first = p->next; MI8_FREE(p, sizeof(*p) + p->length); }
+ 	h->last = NULL; h->queued = 0;
+diff --git a/bsd/dev/mi8_hostsvc.h b/bsd/dev/mi8_hostsvc.h
+index 21b119c..9e2c1d7 100644
+--- a/bsd/dev/mi8_hostsvc.h
++++ b/bsd/dev/mi8_hostsvc.h
+@@ -58,6 +58,7 @@ struct mi8_hostsvc;
+ struct mi8_hostsvc *mi8_hostsvc_create(const struct mi8_hostsvc_cfg *);
+ int mi8_hostsvc_start(struct mi8_hostsvc *);
+ void mi8_hostsvc_poll(struct mi8_hostsvc *);
++void mi8_hostsvc_snapshot(struct mi8_hostsvc *);
+ void mi8_hostsvc_stop(struct mi8_hostsvc *);
+ void mi8_hostsvc_destroy(struct mi8_hostsvc *);
+ 
