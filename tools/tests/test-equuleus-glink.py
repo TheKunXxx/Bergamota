@@ -3,7 +3,8 @@
 from pathlib import Path
 import subprocess,tempfile,os
 repo=Path(__file__).resolve().parents[2]
-rmtfs=bool(os.environ.get('EQUULEUS_TEST_0157'))
+tftp_ram=bool(os.environ.get('EQUULEUS_TEST_0158'))
+rmtfs=tftp_ram or bool(os.environ.get('EQUULEUS_TEST_0157'))
 hostsvc=rmtfs or bool(os.environ.get('EQUULEUS_TEST_0155'))
 servreg=hostsvc or bool(os.environ.get('EQUULEUS_TEST_0154'))
 with tempfile.TemporaryDirectory() as td:
@@ -13,7 +14,7 @@ with tempfile.TemporaryDirectory() as td:
  conf=root/'bsd/conf/files';conf.parent.mkdir(parents=True)
  conf.write_text(''.join('fixture/prefix%u.c\tstandard\n' % i for i in range(117))+'bsd/dev/beryllium_wlan.c\t\tstandard\nbsd/dev/equuleus_mss.c\t\tstandard\nbsd/dev/beryllium_bt_hci.c\t\tstandard\n'+''.join('fixture/suffix%u.c\tstandard\n' % i for i in range(12)))
  subprocess.run(['git','init','-q',td],check=True)
- for prefix in ['0150','0151','0152','0153']+(['0154'] if servreg else [])+(['0155'] if hostsvc else [])+(['0156','0157'] if rmtfs else []):
+ for prefix in ['0150','0151','0152','0153']+(['0154'] if servreg else [])+(['0155'] if hostsvc else [])+(['0156','0157'] if rmtfs else [])+(['0158'] if tftp_ram else []):
   patch=next((repo/'xnu/patches').glob(prefix+'-*'))
   subprocess.run(['git','apply','--check',str(patch)],cwd=root,check=True)
   subprocess.run(['git','apply',str(patch)],cwd=root,check=True)

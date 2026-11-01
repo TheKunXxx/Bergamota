@@ -1,0 +1,239 @@
+diff --git a/bsd/dev/equuleus_mss.c b/bsd/dev/equuleus_mss.c
+index 0a1486e..78e3faa 100644
+--- a/bsd/dev/equuleus_mss.c
++++ b/bsd/dev/equuleus_mss.c
+@@ -1989,6 +1989,7 @@ equuleus_glink_probe(void)
+                 struct mi8_hostsvc_cfg hc; bzero(&hc, sizeof(hc));
+                 hc.qrtr=mi8_glink_qrtr_ops(g); hc.publish=eq_host_publish;
+                 hc.file_size=eq_firmware_size; hc.file_read=eq_firmware_read;
++                hc.ram_writes=mss_rmtfs_test ? 1u : 0u;
+                 hc.domains=eq_domains; hc.n_domains=2; hc.ctx=g; hc.log=eq_glink_log;
+                 hs=mi8_hostsvc_create(&hc);
+                 if (!hs || mi8_hostsvc_start(hs)) { result=EIO; break; }
+@@ -2519,7 +2520,7 @@ equuleus_mss_probe(void)
+     if (mode == 11) { equuleus_rmtfs_preflight(); return; }
+     mss_rmtfs_test = mode == 12;
+     if (mss_rmtfs_test && !equuleus_rmtfs_prepare()) { say("eqrf: prepare refused; full reboot required\n"); return; }
+-    say("eqmss: port 0157, mode %u; GLINK mode8/9/10/12, servreg mode9/10/12, firmware services mode10/12; no Wi-Fi\n", mode);
++    say("eqmss: port 0158, mode %u; GLINK mode8/9/10/12, servreg mode9/10/12, firmware services mode10/12; no Wi-Fi\n", mode);
+     mss_w2a();
+     if (mode == 2) {
+         mss_w2bc(2);
+diff --git a/bsd/dev/mi8_hostsvc.c b/bsd/dev/mi8_hostsvc.c
+index ef5b6bd..2a512b1 100644
+--- a/bsd/dev/mi8_hostsvc.c
++++ b/bsd/dev/mi8_hostsvc.c
+@@ -65,6 +65,8 @@ enum { LOG_OPEN, LOG_ALLOC, LOG_RW, LOG_RRQ, LOG_WRQ, LOG_PDM, LOG_OTHER, LOG_ER
+ #define TFTP_WINDOW 1u
+ #define QMI_RESPONSE 4096u
+ #define SESSIONS 8
++#define RAM_FILE_BYTES (2u * 1024u * 1024u)
++#define RAM_FILES 8
+ 
+ static const char *const audio_services[] = { "avs/audio", "tms/servreg" };
+ static const char *const base_services[] = { "tms/servreg" };
+@@ -84,12 +86,15 @@ struct tlv { const uint8_t *p; uint16_t n; };
+ struct builder { uint8_t *p; unsigned n, capacity; bool failed; };
+ struct tftp {
+ 	bool live, write, done, oack;
++	unsigned ram_slot;
++	bool declared;
+ 	uint32_t node, port, blocksize, window;
+ 	uint64_t size, acked, sent, final, dropped;
+ 	char path[263];
+ 	uint8_t request[1024], options[256];
+ 	unsigned request_size, option_size;
+ };
++struct ram_file { uint8_t *bytes; uint64_t size; bool complete; char path[263]; };
+ struct endpoint { struct mi8_hostsvc *h; unsigned kind; struct redwood_qrtr_port *port; };
+ struct pending {
+ 	struct pending *next;
+@@ -103,6 +108,8 @@ struct mi8_hostsvc {
+ 	struct endpoint endpoints[3];
+ 	uint64_t logs[LOG_CLASSES];
+ 	unsigned requests, replies, rejected;
++	unsigned received[3], answered[3];
++	struct ram_file files[RAM_FILES];
+ 	struct tftp sessions[SESSIONS];
+ 	struct pending *first, *last;
+ 	unsigned queued;
+@@ -203,7 +210,8 @@ text(const uint8_t *p, unsigned n, char *out, unsigned capacity)
+ static int
+ send_reply(struct mi8_hostsvc *h, unsigned endpoint, uint32_t node, uint32_t port, const void *p, unsigned n)
+ {
+-	if (h->replies >= 128) return HS_IO;
++	if (h->cfg.ram_writes ? h->answered[endpoint] >= (endpoint == 1 ? 8192u : 512u) : h->replies >= 128) return HS_IO;
++	h->answered[endpoint]++;
+ 	h->replies++;
+ 	int error = h->cfg.qrtr->send(h->endpoints[endpoint].port, node, port, p, n);
+ 	if (error) LOG(h, LOG_ERROR, "mi8hs: ERROR send endpoint=%u errno=%d\n", endpoint, error);
+@@ -345,7 +353,7 @@ file_path(const char *input, char *out)
+ 		const char *end = strchr(component, '/');
+ 		unsigned n = end ? (unsigned)(end - component) : (unsigned)strlen(component), i;
+ 		if (!n || (n == 1 && component[0] == '.') || (n == 2 && !memcmp(component, "..", 2))) return false;
+-		for (i = 0; i < n; i++) if ((unsigned char)component[i] < 32 || component[i] == '\\' || component[i] == ':') return false;
++		for (i = 0; i < n; i++) if (((unsigned char)component[i] < 32 || (unsigned char)component[i] > 126) || component[i] == '\\' || component[i] == ':') return false;
+ 		if (!end) break;
+ 		component = end + 1;
+ 	}
+@@ -391,7 +399,8 @@ tftp_window(struct mi8_hostsvc *h, struct tftp *s)
+ 		uint64_t offset = (block - 1) * s->blocksize, left = s->size - offset;
+ 		unsigned n = left > s->blocksize ? s->blocksize : (unsigned)left;
+ 		setbe16(bytes, 3); setbe16(bytes + 2, (unsigned)block);
+-		if (n && h->cfg.file_read(h->cfg.ctx, s->path, offset, bytes + 4, n)) {
++		if (n && s->ram_slot) memcpy(bytes + 4, h->files[s->ram_slot-1].bytes + offset, n);
++		if (n && !s->ram_slot && h->cfg.file_read(h->cfg.ctx, s->path, offset, bytes + 4, n)) {
+ 			tftp_error(h, s->node, s->port, 0, "read failure"); s->done = true; break;
+ 		}
+ 		{
+@@ -414,7 +423,8 @@ tftp_open(struct mi8_hostsvc *h, uint32_t node, uint32_t port, const uint8_t *re
+ 	char filename[256], mode[16], key[32], val[32], path[263];
+ 	uint32_t blksize = 512, window = 1, timeout = 0;
+ 	const char *tname = "timeout", *wname = "windowsize";
+-	uint64_t size = 0, value;
++	uint64_t size = 0, value, declared = 0;
++	unsigned ram_slot = 0;
+ 	struct builder b;
+ 	if (length > 1024 || !field(&p, &left, filename, sizeof(filename)) || !field(&p, &left, mode, sizeof(mode)) ||
+ 	    !ascii_equal(mode, "octet") || !file_path(filename, path)) {
+@@ -438,6 +448,8 @@ tftp_open(struct mi8_hostsvc *h, uint32_t node, uint32_t port, const uint8_t *re
+ 			blksize = value > TFTP_BLOCK ? TFTP_BLOCK : (uint32_t)value;
+ 		} else if (bit == 2) {
+ 			if (!write && value) goto bad_options;
++			declared = value;
++			if (write && declared > RAM_FILE_BYTES) goto bad_options;
+ 		} else if (bit == 4) {
+ 			if (value < 1 || value > 65535) goto bad_options;
+ 			timeout = (uint32_t)value;
+@@ -452,29 +464,40 @@ tftp_open(struct mi8_hostsvc *h, uint32_t node, uint32_t port, const uint8_t *re
+ 		if (!free_slot && (!v->live || v->done)) free_slot = v;
+ 	}
+ 	if (s && s->request_size == length && !memcmp(s->request, request, length) && !s->done) {
+-		if (s->write) tftp_ack(h, s); else tftp_window(h, s);
++		if (s->write && !s->oack) tftp_ack(h, s); else tftp_window(h, s);
+ 		return;
+ 	}
+ 	if (!s) s = free_slot;
+ 	if (!s) { tftp_error(h, node, port, 0, "session capacity"); return; }
+-	if (!write && h->cfg.file_size(h->cfg.ctx, path, &size)) { h->cfg.log(h->cfg.ctx, "mi8hs: tftp rrq file=%s not found\n", path); tftp_error(h, node, port, 1, "not found"); return; }
++	/* Completed RAM files remain immutable until stop, including during RRQ. */
++	for (i = 0; i < RAM_FILES; i++) if (h->files[i].bytes && !strcmp(h->files[i].path, path)) {
++		if (write || !h->files[i].complete) { tftp_error(h,node,port,6,"RAM file exists or incomplete"); return; }
++		ram_slot=i+1; size=h->files[i].size; break;
++	}
++	if (!write && !ram_slot && h->cfg.file_size(h->cfg.ctx,path,&size)) { tftp_error(h,node,port,1,"not found"); return; }
++	if (write) {
++		for (i=0;i<RAM_FILES;i++) if (!h->files[i].bytes) break;
++		if (i==RAM_FILES) { tftp_error(h,node,port,3,"RAM file capacity"); return; }
++		uint8_t *data=MI8_ALLOC(RAM_FILE_BYTES);
++		if (!data) { tftp_error(h,node,port,3,"RAM allocation failed"); return; }
++		h->files[i].bytes=data; h->files[i].size=0; h->files[i].complete=false;
++		memcpy(h->files[i].path,path,strlen(path)+1); ram_slot=i+1;
++	}
++	/* Abandoned incomplete files are not exposed to RRQ; reclaimed at stop. */
+ 	memset(s, 0, sizeof(*s)); s->live = true; s->write = write; s->node = node; s->port = port;
+-	s->size = size; s->blocksize = write ? 512 : blksize; s->window = write ? 1 : window;
++	s->size = write ? declared : size; s->declared = (opts & 2) != 0;
++	s->ram_slot = ram_slot; s->blocksize = blksize; s->window = window;
+ 	s->final = size / s->blocksize + 1;
+ 	memcpy(s->path, path, strlen(path) + 1); memcpy(s->request, request, length); s->request_size = length;
+-	if (write) {
+-		LOG(h, LOG_WRQ, "mi8hs: tftp wrq file=%s dropped %llu bytes\n", path, 0ull);
+-		tftp_ack(h, s); return;
+-	}
+-	LOG(h, LOG_RRQ, "mi8hs: tftp rrq file=%s size=%llu\n", path, (unsigned long long)size);
++	LOG(h, write ? LOG_WRQ : LOG_RRQ, "mi8hs: tftp %s file=%s size=%llu RAM=%u\n",write?"wrq":"rrq",path,(unsigned long long)s->size,ram_slot);
+ 	b.p = s->options; b.n = 2; b.capacity = sizeof(s->options); b.failed = false;
+ 	setbe16(s->options, 6);
+ 	if (opts & 1) option(&b, "blksize", blksize);
+-	if (opts & 2) option(&b, "tsize", size);
++	if (opts & 2) option(&b, "tsize", s->size);
+ 	if (opts & 4) option(&b, tname, timeout);
+ 	if (opts & 8) option(&b, wname, window);
+ 	s->oack = opts != 0; s->option_size = b.n;
+-	tftp_window(h, s);
++	if (write && !s->oack) tftp_ack(h,s); else tftp_window(h,s);
+ 	return;
+ bad_options:
+ 	tftp_error(h, node, port, 8, "bad options");
+@@ -487,7 +510,10 @@ tftp_request(struct mi8_hostsvc *h, uint32_t node, uint32_t port, const uint8_t
+ 	unsigned op, block, i;
+ 	if (n < 2) { tftp_error(h, node, port, 4, "short opcode"); return; }
+ 	op = getbe16(p);
+-	if (op == 2) { tftp_error(h, node, port, 2, "read-only firmware service"); return; }
++	if (op == 2) {
++		if (!h->cfg.ram_writes) { tftp_error(h,node,port,2,"read-only firmware service"); return; }
++		tftp_open(h,node,port,p,n,true); return;
++	}
+ 	if (op == 1) { tftp_open(h, node, port, p, n, false); return; }
+ 	for (i = 0; i < SESSIONS; i++) if (h->sessions[i].live && h->sessions[i].node == node && h->sessions[i].port == port) {
+ 		s = &h->sessions[i]; break;
+@@ -511,10 +537,24 @@ tftp_request(struct mi8_hostsvc *h, uint32_t node, uint32_t port, const uint8_t
+ 		else tftp_window(h, s);
+ 	} else if (op == 3 && s->write) {
+ 		if (n - 4 > s->blocksize) { tftp_error(h, node, port, 4, "oversized DATA"); return; }
++		struct ram_file *f=&h->files[s->ram_slot-1];
+ 		if (!s->done && block == ((s->acked + 1) & 65535)) {
+-			s->acked++; s->dropped += n - 4; s->done = n - 4 < s->blocksize;
++			unsigned bytes=n-4;
++			if (bytes > RAM_FILE_BYTES-f->size ||
++			    (s->declared && (f->size > s->size || bytes > s->size-f->size ||
++			    (bytes<s->blocksize && f->size+bytes!=s->size)))) {
++				tftp_error(h,node,port,3,"RAM size limit or tsize mismatch"); return;
++			}
++			/* Store before ACK. Retries never append the same block twice. */
++			memcpy(f->bytes+f->size,p+4,bytes); f->size+=bytes;
++			s->acked++; s->oack=false; s->done=bytes<s->blocksize;
++			if (s->done) { f->complete=true; LOG(h,LOG_WRQ,"mi8hs: RAM complete file=%s bytes=%llu\n",s->path,(unsigned long long)f->size); }
++		} else if (block == (s->acked & 65535) && s->acked) {
++			uint64_t off=(s->acked-1)*s->blocksize;
++			if (off>f->size || n-4!=f->size-off || memcmp(f->bytes+off,p+4,n-4)) {
++				tftp_error(h,node,port,4,"conflicting duplicate DATA"); return;
++			}
+ 		}
+-		LOG(h, LOG_WRQ, "mi8hs: tftp wrq file=%s dropped %llu bytes\n", s->path, (unsigned long long)s->dropped);
+ 		tftp_ack(h, s);
+ 	} else tftp_error(h, node, port, 4, "unexpected opcode");
+ }
+@@ -526,13 +566,13 @@ receive(void *ctx, uint32_t node, uint32_t port, const void *data, size_t n)
+ 	struct mi8_hostsvc *h = e->h;
+ 	struct pending *p;
+ 	if (!h->started) return;
+-	if (node != 0 || !port || port >= 0xfffffffeu || !data || !n || n > MAX_REQUEST || h->queued >= 8 || h->requests >= 128) { h->rejected++; LOG(h, LOG_ERROR, "mi8hs: ERROR request peer, queue or length\n"); return; }
++	if (node != 0 || !port || port >= 0xfffffffeu || !data || !n || n > MAX_REQUEST || h->queued >= (h->cfg.ram_writes && e->kind==1 ? 6u : 8u) || (h->cfg.ram_writes ? h->received[e->kind] >= (e->kind==1 ? 8192u : 512u) : h->requests >= 128)) { h->rejected++; LOG(h, LOG_ERROR, "mi8hs: ERROR request peer, queue or length\n"); return; }
+ 	p = MI8_ALLOC(sizeof(*p) + n);
+ 	if (!p) { LOG(h, LOG_ERROR, "mi8hs: ERROR request allocation\n"); return; }
+ 	p->next = NULL; p->node = node; p->port = port; p->kind = e->kind; p->length = (unsigned)n;
+ 	memcpy(p->bytes, data, n);
+ 	if (h->last) h->last->next = p; else h->first = p;
+-	h->last = p; h->queued++; h->requests++;
++	h->last = p; h->queued++; h->requests++; h->received[e->kind]++;
+ }
+ 
+ void
+@@ -614,6 +654,13 @@ mi8_hostsvc_stop(struct mi8_hostsvc *h)
+ 	while ((p = h->first) != NULL) { h->first = p->next; MI8_FREE(p, sizeof(*p) + p->length); }
+ 	h->last = NULL; h->queued = 0;
+ 	LOG(h, LOG_OTHER, "mi8hs: summary requests=%u replies=%u rejected=%u\n", h->requests, h->replies, h->rejected);
++	for (i=0;i<RAM_FILES;i++) if (h->files[i].bytes) {
++		/* Volatile wipe must survive optimization before release. */
++		volatile uint8_t *v=h->files[i].bytes;
++		for (unsigned j=0;j<RAM_FILE_BYTES;j++) v[j]=0;
++		MI8_FREE(h->files[i].bytes,RAM_FILE_BYTES);
++	}
++	memset(h->files,0,sizeof(h->files));
+ 	memset(h->sessions, 0, sizeof(h->sessions));
+ }
+ 
+diff --git a/bsd/dev/mi8_hostsvc.h b/bsd/dev/mi8_hostsvc.h
+index 00618f0..21b119c 100644
+--- a/bsd/dev/mi8_hostsvc.h
++++ b/bsd/dev/mi8_hostsvc.h
+@@ -45,6 +45,7 @@ struct mi8_hostsvc_cfg {
+ 	int (*file_read)(void *, const char *, uint64_t, void *, uint64_t);
+ 	const struct mi8_pd_domain *domains;
+ 	unsigned n_domains;
++	unsigned ram_writes; /* Opt-in bounded volatile TFTP store; no disk writes. */
+ 	void (*log)(void *, const char *, ...);
+ 	void *ctx;
+ };
