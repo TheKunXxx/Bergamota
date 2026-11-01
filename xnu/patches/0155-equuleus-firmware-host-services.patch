@@ -1,0 +1,914 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -119,4 +119,5 @@
+ bsd/dev/equuleus_mss.c		standard
+ bsd/dev/equuleus_glink.c		standard
+ bsd/dev/equuleus_servreg.c		standard
++bsd/dev/mi8_hostsvc_k.c			standard
+ bsd/dev/beryllium_bt_hci.c		standard
+diff --git a/bsd/dev/equuleus_mss.c b/bsd/dev/equuleus_mss.c
+index 34cb388..3440612 100644
+--- a/bsd/dev/equuleus_mss.c
++++ b/bsd/dev/equuleus_mss.c
+@@ -20,6 +20,7 @@
+ #include "sweet_board.h"
+ #include "equuleus_glink.h"
+ #include "equuleus_servreg.h"
++#include "mi8_hostsvc.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void ml_io_unmap(vm_offset_t, vm_size_t);
+@@ -1786,6 +1787,7 @@ modem_watch(uint32_t seconds, uint32_t after_ready_ms)
+ /* 0153: bounded dipper GLINK/QRTR transport probe. No RMTFS, file service or WLFW. */
+ static bool mss_glink_test;
+ static bool mss_servreg_test;
++static bool mss_hostsvc_test;
+ static void eq_servreg_log(void *ctx, const char *event, uint32_t a, uint32_t b)
+ {
+ 	(void)ctx; say("eqsr: %s: %#x %#x\n", event, a, b);
+@@ -1879,13 +1881,50 @@ eq_glink_layout(struct eq_glink_io *io)
+ 	return true;
+ }
+ 
++/* Firmware-only adapter: no partition/NV write callbacks or shared RMTFS memory. */
++static bool eq_firmware_path(const char *p)
++{
++ if (!p || strncmp(p, "image/", 6)) return false;
++ p += 6;
++ size_t n = strlen(p);
++ if (!n || n > 12 || !strcmp(p, ".") || !strcmp(p, "..")) return false;
++ for (size_t i=0; i<n; i++) {
++  unsigned char c = (unsigned char)p[i];
++  if (!((c>='a' && c<='z') || (c>='A' && c<='Z') || (c>='0' && c<='9') || c=='.' || c=='_' || c=='-')) return false;
++ }
++ return true;
++}
++static int eq_firmware_size(void *ctx, const char *path, uint64_t *size)
++{
++ struct fs_file f; (void)ctx;
++ if (!eq_firmware_path(path) || !fs_lookup(path, &f) || f.dir || !f.size || f.size > (8u<<20)) return ENOENT;
++ *size=f.size; return 0;
++}
++static int eq_firmware_read(void *ctx, const char *path, uint64_t offset, void *dst, uint64_t n)
++{
++ struct fs_file f; (void)ctx;
++ if (!eq_firmware_path(path) || !fs_lookup(path, &f) || f.dir || !f.size || f.size>(8u<<20) || offset>f.size || n>f.size-offset) return EINVAL;
++ return fs_file_read(&f, offset, dst, n);
++}
++static int eq_host_publish(void *ctx, struct redwood_qrtr_port *p, uint32_t service, uint32_t version, uint32_t instance)
++{
++ return mi8_glink_qrtr_publish(ctx, p, service, version, instance);
++}
++static const char *const eq_root_services[] = { "tms/servreg" };
++static const char *const eq_wlan_services[] = { "kernel/elf_loader", "wlan/fw", "tms/servreg" };
++static const struct mi8_pd_domain eq_domains[] = {
++ { "msm/modem/root_pd", 180, eq_root_services, 1 },
++ { "msm/modem/wlan_pd", 180, eq_wlan_services, 3 }
++};
++
+ void
+ equuleus_glink_probe(void)
+ {
+ 	struct eq_glink_io io;
+ 	struct equuleus_servreg sr;
++	struct mi8_hostsvc *hs = NULL;
+ 	bool sr_started = false;
+-	uint64_t budget = mss_servreg_test ? 20000000ull : 10000000ull;
++	uint64_t budget = mss_hostsvc_test ? 30000000ull : (mss_servreg_test ? 20000000ull : 10000000ull);
+ 	struct mi8_glink_cfg cfg;
+ 	struct mi8_glink *g = NULL;
+ 	struct mi8_qrtr_server servers[64];
+@@ -1893,10 +1932,10 @@ equuleus_glink_probe(void)
+ 	bool started = false;
+ 	int result = ENOENT;
+ 
+-	say("eqgl: bounded GLINK/QRTR; servreg=%u budget_us=%llu; no host file services\n", mss_servreg_test ? 1u : 0u, budget);
++	say("eqgl: bounded GLINK/QRTR; servreg=%u budget_us=%llu; firmware_services=%u\n", mss_servreg_test ? 1u : 0u, budget, mss_hostsvc_test ? 1u : 0u);
+ 	bzero(&sr, sizeof(sr));
+ 	bzero(&io, sizeof(io)); bzero(&cfg, sizeof(cfg));
+-	for (unsigned poll = 0; poll < (mss_servreg_test ? 40000u : 20000u) && now_us() - began < budget; poll++) {
++	for (unsigned poll = 0; poll < (mss_hostsvc_test ? 60000u : (mss_servreg_test ? 40000u : 20000u)) && now_us() - began < budget; poll++) {
+ 		if (poll % 200 == 0) {
+ 			struct smp2p state;
+ 			if (!dsp_words(&state) || (dsp_state(&state) & DSP_FATAL)) { result = EIO; break; }
+@@ -1912,6 +1951,15 @@ equuleus_glink_probe(void)
+ 			result = mi8_glink_start(g);
+ 			if (result) { break; }
+ 			started = true;
++            if (mss_hostsvc_test) {
++                struct mi8_hostsvc_cfg hc; bzero(&hc, sizeof(hc));
++                hc.qrtr=mi8_glink_qrtr_ops(g); hc.publish=eq_host_publish;
++                hc.file_size=eq_firmware_size; hc.file_read=eq_firmware_read;
++                hc.domains=eq_domains; hc.n_domains=2; hc.ctx=g; hc.log=eq_glink_log;
++                hs=mi8_hostsvc_create(&hc);
++                if (!hs || mi8_hostsvc_start(hs)) { result=EIO; break; }
++                say("eqhs: mode10 firmware-only services64/4096; RMTFS14 disabled; no NV writes\n");
++            }
+ 			if (mss_servreg_test) {
+ 				sr_started = equuleus_servreg_start(&sr, mi8_glink_qrtr_ops(g), eq_servreg_log, NULL) == 0;
+ 				if (!sr_started) { result = EIO; break; }
+@@ -1920,7 +1968,9 @@ equuleus_glink_probe(void)
+ 		if (started) {
+ 			mi8_glink_poll_once(g);
+ 			if (io.fault) { result = EFAULT; break; }
+-			if (sr_started) { equuleus_servreg_poll(&sr, now_us()); }
++			if (hs) { mi8_hostsvc_poll(hs); }
++			if (io.fault) { result = EFAULT; break; }
++			if (sr_started && now_us() - began < budget) { equuleus_servreg_poll(&sr, now_us()); }
+ 			if (io.fault) { result = EFAULT; break; }
+ 		}
+ 		delay_for_interval(500, NSEC_PER_USEC);
+@@ -1935,6 +1985,7 @@ equuleus_glink_probe(void)
+ 			say("eqsr: summary registered=%u up=%u state=%#x attempts=%u sends=%u notifications=%u ack_ok=%u rejected=%u pending=%u\n", sr.registered, sr.up, sr.state, sr.attempts, sr.sends, sr.notifications, sr.acknowledgements, sr.rejected, sr.count + (sr.ack_txn != 0));
+ 			equuleus_servreg_stop(&sr);
+ 		}
++		if (hs) { mi8_hostsvc_destroy(hs); }
+ 		mi8_glink_destroy(g);
+ 	} else { say("eqgl: transport not started result=%d (items478/479/480 required)\n", result); }
+ 	say("eqgl: bounded probe ended; existing cooperative stop/halt guard follows\n");
+@@ -2345,20 +2396,21 @@ equuleus_mss_probe(void)
+         !PE_parse_boot_argn("sweetmss", &mode, sizeof(mode)) || mode == 0) {
+         return;
+     }
+-    if (mode != 1 && mode != 2 && mode != 5 && mode != 6 && mode != 7 && mode != 8 && mode != 9) {
+-        say("eqmss: supported sweetmss modes: 1 survey, 2 rails/clocks, 5 MBA only, 6 MPSS/SMP2P, 7 MPSS with explicit HALT on all ports, 8 GLINK/QRTR probe, 9 servreg listener\n");
++    if (mode != 1 && mode != 2 && mode != 5 && mode != 6 && mode != 7 && mode != 8 && mode != 9 && mode != 10) {
++        say("eqmss: supported sweetmss modes: 1 survey, 2 rails/clocks, 5 MBA only, 6 MPSS/SMP2P, 7 MPSS with explicit HALT on all ports, 8 GLINK/QRTR probe, 9 servreg listener, 10 firmware host services\n");
+         return;
+     }
+     entered = true;
+-    say("eqmss: port 0154, mode %u; GLINK mode8/9, servreg mode9; no Wi-Fi or host file services\n", mode);
++    say("eqmss: port 0155, mode %u; GLINK mode8/9/10, servreg mode9/10, firmware services mode10; no Wi-Fi\n", mode);
+     mss_w2a();
+     if (mode == 2) {
+         mss_w2bc(2);
+-    } else if (mode == 5 || mode == 6 || mode == 7 || mode == 8 || mode == 9) {
++    } else if (mode == 5 || mode == 6 || mode == 7 || mode == 8 || mode == 9 || mode == 10) {
+         mss_halt_all = mode == 7;
+-        mss_full_test = mode == 6 || mode == 7 || mode == 8 || mode == 9;
+-        mss_glink_test = mode == 8 || mode == 9;
+-        mss_servreg_test = mode == 9;
++        mss_full_test = mode == 6 || mode == 7 || mode == 8 || mode == 9 || mode == 10;
++        mss_glink_test = mode == 8 || mode == 9 || mode == 10;
++        mss_servreg_test = mode == 9 || mode == 10;
++        mss_hostsvc_test = mode == 10;
+         say("eqmss: explicit AXI HALT on all ports: %u\n", mss_halt_all ? 1u : 0u);
+         mss_run_mba();
+     }
+diff --git a/bsd/dev/mi8_hostsvc.c b/bsd/dev/mi8_hostsvc.c
+new file mode 100644
+index 0000000..ef5b6bd
+--- /dev/null
++++ b/bsd/dev/mi8_hostsvc.c
+@@ -0,0 +1,624 @@
++/*
++ * MIT License
++ *
++ * Copyright (c) 2026 yanei and dipper-xnu contributors
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ * Firmware-only host-service extraction from dipper-xnu 4e82c709ea42ebb509fa101b52972fdc890b873e.
++ * Equuleus changes: firmware-only host services, bounded polling and read-only file adapter.
++ */
++#include "mi8_hostsvc.h"
++#include "equuleus_glink.h"
++#include <stdbool.h>
++#include <string.h>
++
++#ifdef MI8_GLINK_HOST_TEST
++#include <stdlib.h>
++#include <errno.h>
++#define HS_ALREADY EALREADY
++#ifndef MI8_ALLOC
++#define MI8_ALLOC(n) calloc(1, (n))
++#define MI8_FREE(p, n) free(p)
++#endif
++#endif
++#ifndef HS_ALREADY
++#define HS_ALREADY 37
++#endif
++#if !defined(MI8_ALLOC) || !defined(MI8_FREE)
++#error "Provide MI8_ALLOC(n) and MI8_FREE(p,n) through an integration header"
++#endif
++
++/* Keep this portable translation unit independent of XNU's include tree. */
++#if !defined(_SYS_REDWOOD_QRTR_H_) && !defined(MI8_GLINK_H)
++struct redwood_qrtr_ops {
++	struct redwood_qrtr_port *(*open)(void (*)(void *, uint32_t, uint32_t, const void *, size_t),
++	    void (*)(void *, bool, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t), void *);
++	int (*send)(struct redwood_qrtr_port *, uint32_t, uint32_t, const void *, size_t);
++	int (*lookup)(struct redwood_qrtr_port *, uint32_t, uint32_t, uint32_t);
++	void (*close)(struct redwood_qrtr_port *);
++};
++#endif
++
++enum { HS_NOMEM = 12, HS_IO = 5, HS_INVAL = 22 };
++enum { Q_NONE = 0, Q_MALFORMED = 1, Q_NOMEM = 2, Q_INTERNAL = 3, Q_BAD_HANDLE = 9, Q_INVAL = 48, Q_UNSUPPORTED = 94 };
++/* Firmware-only extraction: no RMTFS handler or partition callbacks. */
++
++enum { LOG_OPEN, LOG_ALLOC, LOG_RW, LOG_RRQ, LOG_WRQ, LOG_PDM, LOG_OTHER, LOG_ERROR, LOG_CLASSES };
++#define MAX_REQUEST 8192u
++#define TFTP_BLOCK 2048u
++#define TFTP_WINDOW 1u
++#define QMI_RESPONSE 4096u
++#define SESSIONS 8
++
++static const char *const audio_services[] = { "avs/audio", "tms/servreg" };
++static const char *const base_services[] = { "tms/servreg" };
++static const char *const wlan_services[] = { "kernel/elf_loader", "wlan/fw", "tms/servreg" };
++const struct mi8_pd_domain mi8_hostsvc_sdm845_domains[] = {
++	{ "msm/adsp/audio_pd", 74, audio_services, 2 },
++	{ "msm/adsp/root_pd", 74, base_services, 1 },
++	{ "msm/cdsp/root_pd", 76, base_services, 1 },
++	{ "msm/modem/root_pd", 180, base_services, 1 },
++	{ "msm/modem/wlan_pd", 180, wlan_services, 3 },
++	{ "msm/slpi/root_pd", 90, base_services, 1 },
++	{ "msm/slpi/sensor_pd", 90, base_services, 1 }
++};
++const unsigned mi8_hostsvc_sdm845_n_domains = sizeof(mi8_hostsvc_sdm845_domains) / sizeof(mi8_hostsvc_sdm845_domains[0]);
++
++struct tlv { const uint8_t *p; uint16_t n; };
++struct builder { uint8_t *p; unsigned n, capacity; bool failed; };
++struct tftp {
++	bool live, write, done, oack;
++	uint32_t node, port, blocksize, window;
++	uint64_t size, acked, sent, final, dropped;
++	char path[263];
++	uint8_t request[1024], options[256];
++	unsigned request_size, option_size;
++};
++struct endpoint { struct mi8_hostsvc *h; unsigned kind; struct redwood_qrtr_port *port; };
++struct pending {
++	struct pending *next;
++	uint32_t node, port;
++	unsigned kind, length;
++	uint8_t bytes[];
++};
++struct mi8_hostsvc {
++	struct mi8_hostsvc_cfg cfg;
++	bool started, dispatching;
++	struct endpoint endpoints[3];
++	uint64_t logs[LOG_CLASSES];
++	unsigned requests, replies, rejected;
++	struct tftp sessions[SESSIONS];
++	struct pending *first, *last;
++	unsigned queued;
++};
++static bool
++log_due(struct mi8_hostsvc *h, unsigned category)
++{
++	uint64_t n = ++h->logs[category];
++	return h->cfg.log && (n <= 20 || n % 20 == 0);
++}
++#define LOG(h, category, ...) do { if (log_due(h, category)) (h)->cfg.log((h)->cfg.ctx, __VA_ARGS__); } while (0)
++
++static uint64_t
++getle(const uint8_t *p, unsigned n)
++{
++	uint64_t v = 0;
++	unsigned i;
++	for (i = 0; i < n; i++) v |= (uint64_t)p[i] << (8 * i);
++	return v;
++}
++
++static void
++setle(uint8_t *p, uint64_t v, unsigned n)
++{
++	unsigned i;
++	for (i = 0; i < n; i++) p[i] = (uint8_t)(v >> (8 * i));
++}
++
++static unsigned
++getbe16(const uint8_t *p)
++{
++	return (unsigned)p[0] << 8 | p[1];
++}
++
++static void
++setbe16(uint8_t *p, unsigned n)
++{
++	p[0] = (uint8_t)(n >> 8); p[1] = (uint8_t)n;
++}
++
++static void
++append(struct builder *b, const void *p, unsigned n)
++{
++	if (n > b->capacity - b->n) { b->failed = true; return; }
++	if (n) memcpy(b->p + b->n, p, n);
++	b->n += n;
++}
++
++static void
++scalar(struct builder *b, uint64_t v, unsigned n)
++{
++	uint8_t bytes[8];
++	setle(bytes, v, n); append(b, bytes, n);
++}
++
++static void
++add_tlv(struct builder *b, unsigned tag, const void *p, unsigned n)
++{
++	scalar(b, tag, 1); scalar(b, n, 2); append(b, p, n);
++}
++
++static void
++add_number(struct builder *b, unsigned tag, uint64_t v, unsigned n)
++{
++	uint8_t bytes[8];
++	setle(bytes, v, n); add_tlv(b, tag, bytes, n);
++}
++
++static bool
++parse_tlvs(const uint8_t *p, unsigned n, struct tlv *out)
++{
++	memset(out, 0, sizeof(*out) * 256);
++	while (n) {
++		unsigned tag, len;
++		if (n < 3) return false;
++		tag = p[0]; len = (unsigned)getle(p + 1, 2);
++		if (len > n - 3 || out[tag].p) return false;
++		out[tag].p = p + 3; out[tag].n = (uint16_t)len;
++		p += 3 + len; n -= 3 + len;
++	}
++	return true;
++}
++
++static bool
++has(const struct tlv *t, unsigned tag, unsigned bytes)
++{
++	return t[tag].p && t[tag].n == bytes;
++}
++
++static bool
++text(const uint8_t *p, unsigned n, char *out, unsigned capacity)
++{
++	if (!n || n >= capacity || memchr(p, 0, n)) return false;
++	memcpy(out, p, n); out[n] = 0;
++	return true;
++}
++
++static int
++send_reply(struct mi8_hostsvc *h, unsigned endpoint, uint32_t node, uint32_t port, const void *p, unsigned n)
++{
++	if (h->replies >= 128) return HS_IO;
++	h->replies++;
++	int error = h->cfg.qrtr->send(h->endpoints[endpoint].port, node, port, p, n);
++	if (error) LOG(h, LOG_ERROR, "mi8hs: ERROR send endpoint=%u errno=%d\n", endpoint, error);
++	return error;
++}
++
++static bool
++domain_matches(const struct mi8_pd_domain *d, const char *service)
++{
++	unsigned i;
++	for (i = 0; i < d->n_services; i++) if (!strcmp(d->services[i], service)) return true;
++	return false;
++}
++
++static unsigned
++pdm(struct mi8_hostsvc *h, unsigned msg, const struct tlv *t, struct builder *b)
++{
++	char service[65];
++	uint32_t offset = 0;
++	unsigned i, total = 0, count = 0, start;
++	if (msg == 0x24) {
++		if (!t[1].p || !text(t[1].p, t[1].n, service, sizeof(service)) || !t[2].p || t[2].n > 256) return Q_MALFORMED;
++		LOG(h, LOG_OTHER, "mi8hs: pdm PFR service=%s\n", service);
++		return Q_NONE;
++	}
++	if (msg != 0x21) return Q_UNSUPPORTED;
++	if (!t[1].p || !text(t[1].p, t[1].n, service, sizeof(service)) || (t[0x10].p && !has(t, 0x10, 4))) return Q_MALFORMED;
++	if (t[0x10].p) offset = (uint32_t)getle(t[0x10].p, 4);
++	for (i = 0; i < h->cfg.n_domains; i++) if (domain_matches(&h->cfg.domains[i], service)) total++;
++	add_number(b, 0x10, total, 2); add_number(b, 0x11, 1, 2);
++	start = b->n;
++	scalar(b, 0x12, 1); scalar(b, 0, 2); scalar(b, 0, 1);
++	total = 0;
++	for (i = 0; i < h->cfg.n_domains; i++) {
++		const struct mi8_pd_domain *d = &h->cfg.domains[i];
++		unsigned n;
++		if (!domain_matches(d, service)) continue;
++		if (total++ < offset || count == 32) continue;
++		n = (unsigned)strlen(d->name);
++		scalar(b, n, 1); append(b, d->name, n); scalar(b, d->instance, 4);
++		scalar(b, 0, 1); scalar(b, 0, 4); count++;
++	}
++	if (!b->failed) { setle(b->p + start + 1, b->n - start - 3, 2); b->p[start + 3] = (uint8_t)count; }
++	LOG(h, LOG_PDM, "mi8hs: pdm domain list service=%s -> %u domains\n", service, count);
++	return Q_NONE;
++}
++
++static void
++qmi_request(struct mi8_hostsvc *h, unsigned kind, uint32_t node, uint32_t port, const uint8_t *req, unsigned n)
++{
++	struct tlv *t;
++	struct builder b;
++	uint8_t *response;
++	unsigned error = Q_MALFORMED;
++	if (n < 7 || req[0] != 0) { LOG(h, LOG_ERROR, "mi8hs: ERROR invalid QMI request header\n"); return; }
++	response = MI8_ALLOC(QMI_RESPONSE); t = MI8_ALLOC(sizeof(*t) * 256);
++	if (!response || !t) {
++		if (response) MI8_FREE(response, QMI_RESPONSE);
++		if (t) MI8_FREE(t, sizeof(*t) * 256);
++		LOG(h, LOG_ERROR, "mi8hs: ERROR QMI allocation\n"); return;
++	}
++	memset(response, 0, QMI_RESPONSE); response[0] = 2; memcpy(response + 1, req + 1, 4);
++	b.p = response; b.n = 14; b.capacity = QMI_RESPONSE; b.failed = false;
++	if (getle(req + 5, 2) == n - 7 && parse_tlvs(req + 7, n - 7, t))
++		error = pdm(h, (unsigned)getle(req + 3, 2), t, &b);
++	if (b.failed) error = Q_INTERNAL;
++	if (error) {
++		b.n = 14;
++		LOG(h, LOG_ERROR, "mi8hs: ERROR QMI service=%u msg=%u error=%u\n", 64u, (unsigned)getle(req + 3, 2), error);
++	}
++	response[7] = 2; setle(response + 8, 4, 2); setle(response + 10, error ? 1 : 0, 2); setle(response + 12, error, 2);
++	setle(response + 5, b.n - 7, 2);
++	send_reply(h, kind, node, port, response, b.n);
++	MI8_FREE(t, sizeof(*t) * 256); MI8_FREE(response, QMI_RESPONSE);
++}
++
++static bool
++ascii_equal(const char *a, const char *b)
++{
++	while (*a && *b) {
++		unsigned x = (unsigned char)*a++, y = (unsigned char)*b++;
++		if (x >= 'A' && x <= 'Z') x += 'a' - 'A';
++		if (y >= 'A' && y <= 'Z') y += 'a' - 'A';
++		if (x != y) return false;
++	}
++	return !*a && !*b;
++}
++
++static bool
++field(const uint8_t **p, unsigned *n, char *out, unsigned cap)
++{
++	const uint8_t *end = memchr(*p, 0, *n);
++	unsigned length;
++	if (!end) return false;
++	length = (unsigned)(end - *p);
++	if (!text(*p, length, out, cap)) return false;
++	*p += length + 1; *n -= length + 1;
++	return true;
++}
++
++static bool
++decimal(const char *p, uint64_t *value)
++{
++	uint64_t n = 0;
++	if (!*p) return false;
++	while (*p) {
++		unsigned d = (unsigned char)*p++ - '0';
++		if (d > 9 || n > (UINT64_MAX - d) / 10) return false;
++		n = n * 10 + d;
++	}
++	*value = n;
++	return true;
++}
++
++static void
++option(struct builder *b, const char *name, uint64_t value)
++{
++	char reversed[20], result[21];
++	unsigned i = 0, j;
++	do { reversed[i++] = (char)('0' + value % 10); value /= 10; } while (value);
++	for (j = 0; j < i; j++) result[j] = reversed[i - j - 1];
++	result[i] = 0;
++	append(b, name, (unsigned)strlen(name) + 1); append(b, result, i + 1);
++}
++
++static bool
++file_path(const char *input, char *out)
++{
++	const char *p = input, *component;
++	unsigned length;
++	while (*p == '/') p++;
++	if (!strncmp(p, "readonly/firmware/image/", 24)) p += 24;
++	while (*p == '/') p++;
++	if (!strncmp(p, "image/", 6)) p += 6;
++	length = (unsigned)strlen(p);
++	if (!length || length > 255) return false;
++	component = p;
++	for (;;) {
++		const char *end = strchr(component, '/');
++		unsigned n = end ? (unsigned)(end - component) : (unsigned)strlen(component), i;
++		if (!n || (n == 1 && component[0] == '.') || (n == 2 && !memcmp(component, "..", 2))) return false;
++		for (i = 0; i < n; i++) if ((unsigned char)component[i] < 32 || component[i] == '\\' || component[i] == ':') return false;
++		if (!end) break;
++		component = end + 1;
++	}
++	memcpy(out, "image/", 6); memcpy(out + 6, p, length + 1);
++	return true;
++}
++
++static void
++tftp_error(struct mi8_hostsvc *h, uint32_t node, uint32_t port, unsigned code, const char *message)
++{
++	uint8_t bytes[128];
++	unsigned n = (unsigned)strlen(message);
++	if (n > 122) n = 122;
++	setbe16(bytes, 5); setbe16(bytes + 2, code); memcpy(bytes + 4, message, n); bytes[4 + n] = 0;
++	send_reply(h, 1, node, port, bytes, n + 5);
++	LOG(h, LOG_ERROR, "mi8hs: ERROR tftp code=%u %s\n", code, message);
++}
++
++static void
++tftp_ack(struct mi8_hostsvc *h, struct tftp *s)
++{
++	uint8_t bytes[4];
++	setbe16(bytes, 4); setbe16(bytes + 2, (unsigned)s->acked);
++	send_reply(h, 1, s->node, s->port, bytes, sizeof(bytes));
++}
++
++static void
++tftp_window(struct mi8_hostsvc *h, struct tftp *s)
++{
++	uint8_t *bytes;
++	uint64_t block, until = s->acked + s->window;
++	if (s->oack) {
++		int r = send_reply(h, 1, s->node, s->port, s->options, s->option_size);
++
++		LOG(h, LOG_OTHER, "mi8hs: tftp oack %u bytes blocksize %u window %u -> %d\n", s->option_size, s->blocksize, s->window, r);
++		return;
++	}
++	if (s->done) return;
++	if (until > s->final) until = s->final;
++	bytes = MI8_ALLOC(s->blocksize + 4);
++	if (!bytes) { tftp_error(h, s->node, s->port, 0, "out of memory"); return; }
++	for (block = s->acked + 1; block <= until; block++) {
++		uint64_t offset = (block - 1) * s->blocksize, left = s->size - offset;
++		unsigned n = left > s->blocksize ? s->blocksize : (unsigned)left;
++		setbe16(bytes, 3); setbe16(bytes + 2, (unsigned)block);
++		if (n && h->cfg.file_read(h->cfg.ctx, s->path, offset, bytes + 4, n)) {
++			tftp_error(h, s->node, s->port, 0, "read failure"); s->done = true; break;
++		}
++		{
++			int r = send_reply(h, 1, s->node, s->port, bytes, n + 4);
++
++			LOG(h, LOG_OTHER, "mi8hs: tftp data block=%llu bytes=%u -> %d\n", (unsigned long long)block, n, r);
++			if (r) break;
++		}
++		s->sent = block;
++	}
++	MI8_FREE(bytes, s->blocksize + 4);
++}
++
++static void
++tftp_open(struct mi8_hostsvc *h, uint32_t node, uint32_t port, const uint8_t *request, unsigned length, bool write)
++{
++	struct tftp *s = NULL, *free_slot = NULL;
++	const uint8_t *p = request + 2;
++	unsigned left = length - 2, i, opts = 0;
++	char filename[256], mode[16], key[32], val[32], path[263];
++	uint32_t blksize = 512, window = 1, timeout = 0;
++	const char *tname = "timeout", *wname = "windowsize";
++	uint64_t size = 0, value;
++	struct builder b;
++	if (length > 1024 || !field(&p, &left, filename, sizeof(filename)) || !field(&p, &left, mode, sizeof(mode)) ||
++	    !ascii_equal(mode, "octet") || !file_path(filename, path)) {
++		tftp_error(h, node, port, 4, "bad request or path"); return;
++	}
++	while (left) {
++		unsigned bit = 0;
++		if (!field(&p, &left, key, sizeof(key)) || !field(&p, &left, val, sizeof(val))) goto bad_options;
++		LOG(h, LOG_OTHER, "mi8hs: tftp option %s=%s\n", key, val);
++		if (ascii_equal(key, "blksize")) bit = 1;
++		else if (ascii_equal(key, "tsize")) bit = 2;
++		else if (ascii_equal(key, "timeout")) bit = 4;
++		else if (ascii_equal(key, "timeoutms")) { bit = 4; tname = "timeoutms"; }      /* Qualcomm's own names (EXP-0200) */
++		else if (ascii_equal(key, "windowsize")) bit = 8;
++		else if (ascii_equal(key, "wsize")) { bit = 8; wname = "wsize"; }
++		if (!bit) continue;
++		if ((opts & bit) || !decimal(val, &value)) goto bad_options;
++		opts |= bit;
++		if (bit == 1) {
++			if (value < 8 || value > 65464) goto bad_options;
++			blksize = value > TFTP_BLOCK ? TFTP_BLOCK : (uint32_t)value;
++		} else if (bit == 2) {
++			if (!write && value) goto bad_options;
++		} else if (bit == 4) {
++			if (value < 1 || value > 65535) goto bad_options;
++			timeout = (uint32_t)value;
++		} else {
++			if (value < 1 || value > 65535) goto bad_options;
++			window = value > TFTP_WINDOW ? TFTP_WINDOW : (uint32_t)value;
++		}
++	}
++	for (i = 0; i < SESSIONS; i++) {
++		struct tftp *v = &h->sessions[i];
++		if (v->live && v->node == node && v->port == port) { s = v; break; }
++		if (!free_slot && (!v->live || v->done)) free_slot = v;
++	}
++	if (s && s->request_size == length && !memcmp(s->request, request, length) && !s->done) {
++		if (s->write) tftp_ack(h, s); else tftp_window(h, s);
++		return;
++	}
++	if (!s) s = free_slot;
++	if (!s) { tftp_error(h, node, port, 0, "session capacity"); return; }
++	if (!write && h->cfg.file_size(h->cfg.ctx, path, &size)) { h->cfg.log(h->cfg.ctx, "mi8hs: tftp rrq file=%s not found\n", path); tftp_error(h, node, port, 1, "not found"); return; }
++	memset(s, 0, sizeof(*s)); s->live = true; s->write = write; s->node = node; s->port = port;
++	s->size = size; s->blocksize = write ? 512 : blksize; s->window = write ? 1 : window;
++	s->final = size / s->blocksize + 1;
++	memcpy(s->path, path, strlen(path) + 1); memcpy(s->request, request, length); s->request_size = length;
++	if (write) {
++		LOG(h, LOG_WRQ, "mi8hs: tftp wrq file=%s dropped %llu bytes\n", path, 0ull);
++		tftp_ack(h, s); return;
++	}
++	LOG(h, LOG_RRQ, "mi8hs: tftp rrq file=%s size=%llu\n", path, (unsigned long long)size);
++	b.p = s->options; b.n = 2; b.capacity = sizeof(s->options); b.failed = false;
++	setbe16(s->options, 6);
++	if (opts & 1) option(&b, "blksize", blksize);
++	if (opts & 2) option(&b, "tsize", size);
++	if (opts & 4) option(&b, tname, timeout);
++	if (opts & 8) option(&b, wname, window);
++	s->oack = opts != 0; s->option_size = b.n;
++	tftp_window(h, s);
++	return;
++bad_options:
++	tftp_error(h, node, port, 8, "bad options");
++}
++
++static void
++tftp_request(struct mi8_hostsvc *h, uint32_t node, uint32_t port, const uint8_t *p, unsigned n)
++{
++	struct tftp *s = NULL;
++	unsigned op, block, i;
++	if (n < 2) { tftp_error(h, node, port, 4, "short opcode"); return; }
++	op = getbe16(p);
++	if (op == 2) { tftp_error(h, node, port, 2, "read-only firmware service"); return; }
++	if (op == 1) { tftp_open(h, node, port, p, n, false); return; }
++	for (i = 0; i < SESSIONS; i++) if (h->sessions[i].live && h->sessions[i].node == node && h->sessions[i].port == port) {
++		s = &h->sessions[i]; break;
++	}
++	if (op == 5) { if (s) s->live = false; return; }
++	if (!s) { tftp_error(h, node, port, 5, "unknown transfer"); return; }
++	if (n < 4 || (op == 4 && n != 4)) { tftp_error(h, node, port, 4, "short block"); return; }
++	block = getbe16(p + 2);
++	if (op == 4 && !s->write) {
++		uint64_t ack;
++		LOG(h, LOG_OTHER, "mi8hs: tftp ack file=%s block=%u\n", s->path, block);
++		if (s->oack) {
++			if (block) return;
++			s->oack = false; tftp_window(h, s); return;
++		}
++		if (s->done) return;
++		for (ack = s->acked; ack <= s->sent; ack++) if ((ack & 65535) == block) break;
++		if (ack > s->sent) return;
++		s->acked = ack;
++		if (ack == s->final) s->done = true;
++		else tftp_window(h, s);
++	} else if (op == 3 && s->write) {
++		if (n - 4 > s->blocksize) { tftp_error(h, node, port, 4, "oversized DATA"); return; }
++		if (!s->done && block == ((s->acked + 1) & 65535)) {
++			s->acked++; s->dropped += n - 4; s->done = n - 4 < s->blocksize;
++		}
++		LOG(h, LOG_WRQ, "mi8hs: tftp wrq file=%s dropped %llu bytes\n", s->path, (unsigned long long)s->dropped);
++		tftp_ack(h, s);
++	} else tftp_error(h, node, port, 4, "unexpected opcode");
++}
++
++static void
++receive(void *ctx, uint32_t node, uint32_t port, const void *data, size_t n)
++{
++	struct endpoint *e = ctx;
++	struct mi8_hostsvc *h = e->h;
++	struct pending *p;
++	if (!h->started) return;
++	if (node != 0 || !port || port >= 0xfffffffeu || !data || !n || n > MAX_REQUEST || h->queued >= 8 || h->requests >= 128) { h->rejected++; LOG(h, LOG_ERROR, "mi8hs: ERROR request peer, queue or length\n"); return; }
++	p = MI8_ALLOC(sizeof(*p) + n);
++	if (!p) { LOG(h, LOG_ERROR, "mi8hs: ERROR request allocation\n"); return; }
++	p->next = NULL; p->node = node; p->port = port; p->kind = e->kind; p->length = (unsigned)n;
++	memcpy(p->bytes, data, n);
++	if (h->last) h->last->next = p; else h->first = p;
++	h->last = p; h->queued++; h->requests++;
++}
++
++void
++mi8_hostsvc_poll(struct mi8_hostsvc *h)
++{
++	struct pending *p;
++	if (!h || !h->started) return;
++	/* GLINK send may pump another request before the current response is sent. */
++	if (h->dispatching) return;
++	h->dispatching = true;
++	if ((p = h->first) != NULL) {
++		h->first = p->next; if (!h->first) h->last = NULL;
++		if (p->kind == 1) tftp_request(h, p->node, p->port, p->bytes, p->length);
++		else qmi_request(h, p->kind, p->node, p->port, p->bytes, p->length);
++		h->queued--;
++		MI8_FREE(p, sizeof(*p) + p->length);
++	}
++	h->dispatching = false;
++}
++
++struct mi8_hostsvc *
++mi8_hostsvc_create(const struct mi8_hostsvc_cfg *cfg)
++{
++	struct mi8_hostsvc *h;
++	unsigned i, j;
++	if (!cfg || !cfg->qrtr || !cfg->qrtr->open || !cfg->qrtr->send || !cfg->qrtr->close || !cfg->publish ||
++	    !cfg->file_size || !cfg->file_read || (!cfg->domains && cfg->n_domains)) return NULL;
++	h = MI8_ALLOC(sizeof(*h));
++	if (!h) return NULL;
++	memset(h, 0, sizeof(*h)); h->cfg = *cfg;
++	if (!cfg->domains) { h->cfg.domains = mi8_hostsvc_sdm845_domains; h->cfg.n_domains = mi8_hostsvc_sdm845_n_domains; }
++	if (h->cfg.n_domains > 65535) goto bad;
++	for (i = 0; i < h->cfg.n_domains; i++) {
++		const struct mi8_pd_domain *d = &h->cfg.domains[i];
++		if (!d->name || !*d->name || strlen(d->name) > 64 || (!d->services && d->n_services)) goto bad;
++		for (j = 0; j < d->n_services; j++) if (!d->services[j] || !*d->services[j] || strlen(d->services[j]) > 64) goto bad;
++	}
++	for (i = 0; i < 3; i++) { h->endpoints[i].h = h; h->endpoints[i].kind = i; }
++	return h;
++bad:
++	MI8_FREE(h, sizeof(*h)); return NULL;
++}
++
++int
++mi8_hostsvc_start(struct mi8_hostsvc *h)
++{
++	static const uint32_t services[3] = { 14, 4096, 64 }, instances[3] = { 1, 0, 1 };
++	unsigned i;
++	int error;
++	if (!h) return HS_INVAL;
++	if (h->started) return HS_ALREADY;
++	for (i = 1; i < 3; i++) {
++		h->endpoints[i].port = h->cfg.qrtr->open(receive, NULL, &h->endpoints[i]);
++		if (!h->endpoints[i].port) { error = HS_NOMEM; goto fail; }
++	}
++	h->started = true;
++	for (i = 1; i < 3; i++) {
++		error = h->cfg.publish(h->cfg.ctx, h->endpoints[i].port, services[i], 1, instances[i]);
++		if (error) { LOG(h, LOG_ERROR, "mi8hs: publish failed service=%u errno=%d\n", services[i], error); goto fail; }
++		LOG(h, LOG_OTHER, "mi8hs: published service %u\n", services[i]);
++	}
++	return 0;
++fail:
++	mi8_hostsvc_stop(h);
++	return error;
++}
++
++void
++mi8_hostsvc_stop(struct mi8_hostsvc *h)
++{
++	unsigned i;
++	struct pending *p;
++	if (!h) return;
++	/* Close is the transport's callback barrier; free state only after all ports close. */
++	for (i = 0; i < 3; i++) if (h->endpoints[i].port) {
++		h->cfg.qrtr->close(h->endpoints[i].port); h->endpoints[i].port = NULL;
++	}
++	h->started = false;
++	while ((p = h->first) != NULL) { h->first = p->next; MI8_FREE(p, sizeof(*p) + p->length); }
++	h->last = NULL; h->queued = 0;
++	LOG(h, LOG_OTHER, "mi8hs: summary requests=%u replies=%u rejected=%u\n", h->requests, h->replies, h->rejected);
++	memset(h->sessions, 0, sizeof(h->sessions));
++}
++
++void
++mi8_hostsvc_destroy(struct mi8_hostsvc *h)
++{
++	if (h) { mi8_hostsvc_stop(h); MI8_FREE(h, sizeof(*h)); }
++}
+diff --git a/bsd/dev/mi8_hostsvc.h b/bsd/dev/mi8_hostsvc.h
+new file mode 100644
+index 0000000..00618f0
+--- /dev/null
++++ b/bsd/dev/mi8_hostsvc.h
+@@ -0,0 +1,69 @@
++/*
++ * MIT License
++ *
++ * Copyright (c) 2026 yanei and dipper-xnu contributors
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ * Firmware-only host-service extraction from dipper-xnu 4e82c709ea42ebb509fa101b52972fdc890b873e.
++ * Equuleus changes: firmware-only host services, bounded polling and read-only file adapter.
++ */
++#ifndef MI8_HOSTSVC_H
++#define MI8_HOSTSVC_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++struct redwood_qrtr_ops;
++struct redwood_qrtr_port;
++struct mi8_pd_domain {
++	const char *name;
++	uint32_t instance;
++	const char *const *services;
++	unsigned n_services;
++};
++
++struct mi8_hostsvc_cfg {
++	const struct redwood_qrtr_ops *qrtr;
++	int (*publish)(void *, struct redwood_qrtr_port *, uint32_t, uint32_t, uint32_t);
++	int (*file_size)(void *, const char *, uint64_t *);
++	int (*file_read)(void *, const char *, uint64_t, void *, uint64_t);
++	const struct mi8_pd_domain *domains;
++	unsigned n_domains;
++	void (*log)(void *, const char *, ...);
++	void *ctx;
++};
++
++/* Caller may copy/replace this table; create uses it only when domains == NULL. */
++extern const struct mi8_pd_domain mi8_hostsvc_sdm845_domains[];
++extern const unsigned mi8_hostsvc_sdm845_n_domains;
++
++struct mi8_hostsvc;
++struct mi8_hostsvc *mi8_hostsvc_create(const struct mi8_hostsvc_cfg *);
++int mi8_hostsvc_start(struct mi8_hostsvc *);
++void mi8_hostsvc_poll(struct mi8_hostsvc *);
++void mi8_hostsvc_stop(struct mi8_hostsvc *);
++void mi8_hostsvc_destroy(struct mi8_hostsvc *);
++
++/*
++ * Lifecycle calls must not run from a receive callback. QRTR must serialize
++ * callbacks (including reentrant callbacks from send); the service queues them.
++ * Buffers/domain strings and callback ctx outlive the instance. Reads return
++ * zero only after filling the complete requested byte range. No write API.
++ */
++#endif
+diff --git a/bsd/dev/mi8_hostsvc_k.c b/bsd/dev/mi8_hostsvc_k.c
+new file mode 100644
+index 0000000..9c71d1a
+--- /dev/null
++++ b/bsd/dev/mi8_hostsvc_k.c
+@@ -0,0 +1,45 @@
++/*
++ * MIT License
++ *
++ * Copyright (c) 2026 yanei and dipper-xnu contributors
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ * Firmware-only host-service extraction from dipper-xnu 4e82c709ea42ebb509fa101b52972fdc890b873e.
++ * Equuleus changes: firmware-only host services, bounded polling and read-only file adapter.
++ */
++/* The host services (TASK-005) with the kernel's allocator; the service source takes its allocator from the includer. */
++#include <kern/kalloc.h>
++#include <sys/errno.h>
++#define MI8_ALLOC(n)    kalloc_data((n), Z_WAITOK | Z_ZERO)
++#define MI8_FREE(p, n)  kfree_data((p), (n))
++/* the kernel has no memchr */
++static void *
++mi8_memchr(const void *s, int c, size_t n)
++{
++	const unsigned char *p = s;
++
++	for (; n != 0; n--, p++) {
++		if (*p == (unsigned char)c) {
++			return (void *)(uintptr_t)p;
++		}
++	}
++	return NULL;
++}
++#define memchr mi8_memchr
++#include "mi8_hostsvc.c"
