@@ -55,6 +55,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check equuleus WLFW registration and transport
+        run: |
+          python3 tools/tests/test-equuleus-wlfw-register.py
+          EQUULEUS_TEST_0164=1 python3 tools/tests/test-equuleus-glink.py
+
       - name: Fetch build script
         run: |
           git init -q dxb

@@ -10,7 +10,7 @@ with tempfile.TemporaryDirectory() as td:
     dev=root/'bsd/dev';dev.mkdir(parents=True)
     (dev/'equuleus_wlfw_probe.h').write_text('\n'.join(l[1:] for l in tail.splitlines() if l.startswith('+'))+'\n')
     subprocess.run(['git','init','-q',str(root)],check=True)
-    subprocess.run(['git','apply',str(next((repo/'xnu/patches').glob('0164-*.patch')))],cwd=root,check=True)
+    subprocess.run(['git','apply','--include=bsd/dev/equuleus_wlfw_probe.h',str(next((repo/'xnu/patches').glob('0164-*.patch')))],cwd=root,check=True)
     # Only QRTR's ABI is stubbed. All parser, retry and state code is production C.
     (dev/'equuleus_glink.h').write_text('''
 #include <stdbool.h>

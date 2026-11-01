@@ -134,3 +134,14 @@
   w->pending=false;
  }
  #endif
+--- a/bsd/dev/equuleus_mss.c
++++ b/bsd/dev/equuleus_mss.c
+@@ -2598,7 +2598,7 @@
+     if (mode == 11) { equuleus_rmtfs_preflight(); return; }
+     mss_rmtfs_test = mode == 12;
+     if (mss_rmtfs_test && !equuleus_rmtfs_prepare()) { say("eqrf: prepare refused; full reboot required\n"); return; }
+-    say("eqmss: port 0163, mode %u; GLINK mode8/9/10/12, servreg mode9/10/12, firmware services mode10/12; no Wi-Fi\n", mode);
++    say("eqmss: port 0164, mode %u; GLINK mode8/9/10/12, servreg mode9/10/12, firmware services mode10/12; no Wi-Fi\n", mode);
+     mss_w2a();
+     if (mode == 2) {
+         mss_w2bc(2);

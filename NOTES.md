@@ -5,6 +5,7 @@
 - Last hardware evidence: equuleus-wlfw-0163-log.bin transfers wlanmdsp.mbn completely, discovers WLFW service 69 at peer 0:70, then CAP returns result=1/error=90. This is not a working Wi-Fi connection.
 - 0164 adds IND_REGISTER using the pinned dipper/icnss fields, logs registration fw_status and FW_READY/MSA_READY indications, and gates CAP on FW_READY. No MSA assignment, BDF download or WLAN mode changes were added.
 - Ran tools/tests/test-equuleus-wlfw-register.py in the user's WSL: PASS with cc, AddressSanitizer and UndefinedBehaviorSanitizer. Checks registration wire bytes, UP/FW_READY gating, statuses, reentrant response, errors, bounded retries, malformed/truncated packets, peer identity and service restart.
+- 0164 full MSS/GLINK replay and adapter compilation passed with ASan/UBSan; embedded splash and AArch64 shim-address tests passed. CI now tests registration/transport and makes 0164 patch failure fatal.
 - No kernel CI, new boot image, phone boot or partition writes were performed for 0164. Next: full patch-series/kernel compile, then temporary hardware boot and collect REGISTER/indication/summary logs. A registered-but-not-ready firmware still needs the MSA handshake; error 90 alone does not identify a hardware fault.
 
 
