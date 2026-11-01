@@ -3,11 +3,11 @@
 import argparse, struct, hashlib
 from pathlib import Path
 from PIL import Image
-p=argparse.ArgumentParser();p.add_argument('source');p.add_argument('output');a=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('source');p.add_argument('output');p.add_argument('--align-bottom',action='store_true');a=p.parse_args()
 im=Image.open(a.source).convert('RGB');scale=min(1080/im.width,2248/im.height)
 size=(round(im.width*scale),round(im.height*scale))
 im=im.resize(size,Image.Resampling.LANCZOS)
-canvas=Image.new('RGB',(1080,2248));canvas.paste(im,((1080-im.width)//2,(2248-im.height)//2))
+canvas=Image.new('RGB',(1080,2248));canvas.paste(im,((1080-im.width)//2,(2248-im.height) if a.align_bottom else (2248-im.height)//2))
 q=canvas.quantize(colors=256,method=Image.Quantize.MEDIANCUT,dither=Image.Dither.NONE)
 pal=q.getpalette();data=q.tobytes();out=bytearray(struct.pack('<4sHHHH',b'EQSP',1080,2248,256,0))
 for i in range(256):

@@ -10,11 +10,11 @@ for at in range(1036,len(b),3):
  if palette[index]:visible.extend(range(pos,pos+run))
  pos+=run
 assert pos==1080*2248
-# Reject accidentally unscaled source centered inside a larger canvas.
+# Approved China v2: preserve top/side breathing room; clothing reaches last row.
 assert max(p%1080 for p in visible)-min(p%1080 for p in visible)+1>=880
 assert max(p//1080 for p in visible)-min(p//1080 for p in visible)+1>=1750
-assert min(p%1080 for p in visible)>=80 and max(p%1080 for p in visible)<1000
-assert min(p//1080 for p in visible)>=170 and max(p//1080 for p in visible)<2118
+assert min(p%1080 for p in visible)>=48 and max(p%1080 for p in visible)<1032
+assert min(p//1080 for p in visible)>=150 and max(p//1080 for p in visible)==2247
 with tempfile.TemporaryDirectory() as td:
  root=Path(td);c=root/'test.c';exe=root/'test';c.write_text(r'''
 #include <assert.h>
