@@ -10,6 +10,9 @@ for at in range(1036,len(b),3):
  if palette[index]:visible.extend(range(pos,pos+run))
  pos+=run
 assert pos==1080*2248
+# Reject accidentally unscaled source centered inside a larger canvas.
+assert max(p%1080 for p in visible)-min(p%1080 for p in visible)+1>=880
+assert max(p//1080 for p in visible)-min(p//1080 for p in visible)+1>=1750
 assert min(p%1080 for p in visible)>=80 and max(p%1080 for p in visible)<1000
 assert min(p//1080 for p in visible)>=170 and max(p//1080 for p in visible)<2118
 with tempfile.TemporaryDirectory() as td:
@@ -34,3 +37,4 @@ int main(void){
 ''');subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-Wno-misleading-indentation','-fsanitize=address,undefined','-I',str(shim),str(c),'-o',str(exe)],cwd=shim,check=True);subprocess.run([str(exe)],check=True,env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0'})
 assert 'delay_ms(3000);' in (shim/'shim.c').read_text()
 print('3-second show gate checked; actual AArch64 link is checked by shim/build.sh on build host')
+
