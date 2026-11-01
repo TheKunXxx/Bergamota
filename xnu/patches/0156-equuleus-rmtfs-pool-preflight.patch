@@ -1,0 +1,137 @@
+diff --git a/bsd/dev/equuleus_mss.c b/bsd/dev/equuleus_mss.c
+index 3440612..ddfd0ca 100644
+--- a/bsd/dev/equuleus_mss.c
++++ b/bsd/dev/equuleus_mss.c
+@@ -21,6 +21,7 @@
+ #include "equuleus_glink.h"
+ #include "equuleus_servreg.h"
+ #include "mi8_hostsvc.h"
++#include "equuleus_rmtfs_contract.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void ml_io_unmap(vm_offset_t, vm_size_t);
+@@ -2387,6 +2388,62 @@ out:
+ }
+ 
+ /* Called on the existing delayed WLAN thread, once, only for equuleus. */
++/* 0156 preflight: CPU-owned pool; no SCM calls, no remote processor start. */
++extern int sweet_ufs_part_size(const char *, uint8_t *, uint64_t *);
++static bool eq_rmt_guards(volatile uint64_t *pool)
++{
++ for (uint64_t i=0;i<EQ_RMT_PAGE/8;i++) {
++  if (pool[EQ_RMT_PAGE/8+i]!=EQ_RMT_GUARD ||
++      pool[(2*EQ_RMT_PAGE+EQ_RMT_BYTES)/8+i]!=EQ_RMT_GUARD) return false;
++ }
++ return true;
++}
++void equuleus_rmtfs_preflight(void)
++{
++ static vm_offset_t mapping;
++ struct eq_rmt_contract contract;
++ volatile uint64_t *pool, *data;
++ uint8_t *block=NULL;
++ bool ok=false;
++ const char *const names[]={"modemst1","modemst2","fsg","fsc"};
++ const uint64_t expected[]={0x800000,0x800000,0x800000,0x40000};
++ say("eqrmt: port0156 mode11 preflight; no SCM, no RMTFS publication, no NV writes\n");
++ unsigned stamp=0;
++ if (!PE_parse_boot_argn("eqrmtfs_pool",&stamp,sizeof(stamp)) || stamp!=156) {
++  say("eqrmt: this boot has no shim reservation stamp; refusing map\n");return;
++ }
++ if (PAGE_SIZE!=EQ_RMT_PAGE) {say("eqrmt: unsupported kernel page size\n");return;}
++ if (!mapping) mapping=io_map(EQ_RMT_POOL,EQ_RMT_SPAN,VM_WIMG_WCOMB,VM_PROT_READ|VM_PROT_WRITE,true);
++ if (!mapping) {say("eqrmt: pool map failed\n");return;}
++ pool=(volatile uint64_t *)mapping;
++ uint64_t *words=(uint64_t *)&contract;
++ for(unsigned i=0;i<sizeof(contract)/8;i++)words[i]=pool[i];
++ if (!eq_rmt_valid(&contract)) {say("eqrmt: missing/invalid shim reservation; refusing writes\n");return;}
++ if (!eq_rmt_guards(pool)) {say("eqrmt: pool guard mismatch before test\n");return;}
++ data=(volatile uint64_t *)(mapping+2*EQ_RMT_PAGE);
++ for(uint64_t i=0;i<EQ_RMT_BYTES/8;i++)if(data[i]){say("eqrmt: pool not zero at word %llu; refusing writes\n",i);return;}
++ data[0]=EQ_RMT_GUARD;data[EQ_RMT_BYTES/8-1]=~EQ_RMT_GUARD;settle();
++ bool echoed=data[0]==EQ_RMT_GUARD && data[EQ_RMT_BYTES/8-1]==~EQ_RMT_GUARD;
++ data[0]=data[EQ_RMT_BYTES/8-1]=0;settle();
++ if (!echoed || !eq_rmt_guards(pool)) {say("eqrmt: pool readback or guard test failed\n");return;}
++ say("eqrmt: reserved CPU pool data=%#llx bytes=%#llx guards/readback OK\n",(uint64_t)EQ_RMT_DATA,(uint64_t)EQ_RMT_BYTES);
++ block=kalloc_data(4096,Z_WAITOK|Z_ZERO);
++ if (!block){say("eqrmt: read buffer allocation failed\n");return;}
++ for(unsigned i=0;i<4;i++) {
++  uint8_t lun=0;uint64_t bytes=0;
++  int result=sweet_ufs_part_size(names[i],&lun,&bytes);
++  say("eqrmt: partition %s size_rc=%d lun=%u bytes=%llu expected=%llu\n",names[i],result,lun,bytes,expected[i]);
++  if(result || bytes!=expected[i])goto out;
++  result=sweet_ufs_read_part(names[i],0,block,4096);
++  say("eqrmt: partition %s first-block read rc=%d (contents omitted)\n",names[i],result);
++  if(result)goto out;
++ }
++ ok=true;
++out:
++ bzero(block,4096);kfree_data(block,4096);
++ say("eqrmt: preflight %s; pool remains CPU-owned until full reboot\n",ok?"PASS":"FAIL");
++}
++
+ void
+ equuleus_mss_probe(void)
+ {
+@@ -2396,11 +2453,12 @@ equuleus_mss_probe(void)
+         !PE_parse_boot_argn("sweetmss", &mode, sizeof(mode)) || mode == 0) {
+         return;
+     }
+-    if (mode != 1 && mode != 2 && mode != 5 && mode != 6 && mode != 7 && mode != 8 && mode != 9 && mode != 10) {
+-        say("eqmss: supported sweetmss modes: 1 survey, 2 rails/clocks, 5 MBA only, 6 MPSS/SMP2P, 7 MPSS with explicit HALT on all ports, 8 GLINK/QRTR probe, 9 servreg listener, 10 firmware host services\n");
++    if (mode != 1 && mode != 2 && mode != 5 && mode != 6 && mode != 7 && mode != 8 && mode != 9 && mode != 10 && mode != 11) {
++        say("eqmss: supported sweetmss modes: 1 survey, 2 rails/clocks, 5 MBA only, 6 MPSS/SMP2P, 7 MPSS with explicit HALT on all ports, 8 GLINK/QRTR probe, 9 servreg listener, 10 firmware host services, 11 RMTFS preflight\n");
+         return;
+     }
+     entered = true;
++    if (mode == 11) { equuleus_rmtfs_preflight(); return; }
+     say("eqmss: port 0155, mode %u; GLINK mode8/9/10, servreg mode9/10, firmware services mode10; no Wi-Fi\n", mode);
+     mss_w2a();
+     if (mode == 2) {
+diff --git a/bsd/dev/equuleus_rmtfs_contract.h b/bsd/dev/equuleus_rmtfs_contract.h
+new file mode 100644
+index 0000000..4ae98c4
+--- /dev/null
++++ b/bsd/dev/equuleus_rmtfs_contract.h
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: MIT
++ * Equuleus RMTFS preflight contract. CPU-owned until a separate SCM stage.
++ */
++#pragma once
++#include <stdint.h>
++#define EQ_RMT_POOL 0xa8000000ull
++#define EQ_RMT_PAGE 0x4000ull
++#define EQ_RMT_DATA (EQ_RMT_POOL + 2 * EQ_RMT_PAGE)
++#define EQ_RMT_BYTES 0x200000ull
++#define EQ_RMT_SPAN (EQ_RMT_BYTES + 3 * EQ_RMT_PAGE)
++#define EQ_RMT_MAGIC 0x363531544d525145ull
++#define EQ_RMT_GUARD 0xa5b6c7d8e9fa0b1cull
++struct eq_rmt_contract {
++ uint64_t magic, version, pool, span, data, bytes, guard, checksum;
++};
++static inline uint64_t eq_rmt_checksum(const struct eq_rmt_contract *c)
++{
++ return c->magic ^ c->version ^ c->pool ^ c->span ^ c->data ^ c->bytes ^ c->guard;
++}
++static inline int eq_rmt_valid(const struct eq_rmt_contract *c)
++{
++ return c->magic==EQ_RMT_MAGIC && c->version==1 && c->pool==EQ_RMT_POOL &&
++ c->span==EQ_RMT_SPAN && c->data==EQ_RMT_DATA && c->bytes==EQ_RMT_BYTES &&
++ c->guard==EQ_RMT_GUARD && c->checksum==eq_rmt_checksum(c);
++}
++static inline int eq_rmt_overlap(uint64_t a,uint64_t n,uint64_t b,uint64_t s)
++{
++ if (a>UINT64_MAX-n || b>UINT64_MAX-s) return 1;
++ return n && s && a<b+s && b<a+n;
++}
++static inline int eq_rmt_boot_ranges_ok(uint64_t rd_start,uint64_t rd_end,
++ uint64_t dtb,uint64_t dt_size,uint64_t shim_start,uint64_t shim_end,
++ uint64_t kernel,uint64_t kernel_size,uint64_t fb,uint64_t fb_size)
++{
++ return kernel>=0x100000000ull && kernel_size && kernel<=UINT64_MAX-kernel_size &&
++ rd_end>rd_start && shim_end>shim_start && dt_size>=40 && dt_size<=0x1000000 &&
++ !eq_rmt_overlap(EQ_RMT_POOL,EQ_RMT_SPAN,rd_start,rd_end-rd_start) &&
++ !eq_rmt_overlap(EQ_RMT_POOL,EQ_RMT_SPAN,dtb,dt_size) &&
++ !eq_rmt_overlap(EQ_RMT_POOL,EQ_RMT_SPAN,shim_start,shim_end-shim_start) &&
++ !eq_rmt_overlap(EQ_RMT_POOL,EQ_RMT_SPAN,fb,fb_size);
++}

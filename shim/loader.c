@@ -11,6 +11,10 @@
 #include "console.h"
 #include "fdt.h"
 #include "loader.h"
+#if defined(BOARD_EQUULEUS) && defined(EQUULEUS_RMTFS_RESERVE)
+#include "equuleus_rmtfs_fdt.h"
+extern char _head[], _end[];
+#endif
 
 #define BOOT_LINE_LENGTH	608
 #define PAGE_16K		0x4000UL
@@ -100,6 +104,25 @@ const char *loader_boot(uintptr_t dtb)
 	if (rd_end > p->phys_base && rd_start < p->phys_base + p->mem_size)
 		return "ramdisk overlaps kernel memory";
 
+#if defined(BOARD_EQUULEUS) && defined(EQUULEUS_RMTFS_RESERVE)
+ /* ABL has transferred control; no allocator runs below the XNU RAM window.
+  * Claim only ordinary DRAM outside all live FDT and runtime reservations. */
+ uint64_t dt_size = (uint64_t)eq_be32((const uint8_t *)dtb + 4);
+ if (!eq_rmt_boot_ranges_ok(rd_start,rd_end,dtb,dt_size,(uintptr_t)_head,(uintptr_t)_end,
+       p->phys_base,p->mem_size,FB_BASE,(uint64_t)FB_STRIDE*FB_H) ||
+     !eq_rmt_fdt_usable((const uint8_t *)dtb,dt_size))
+  return "RMTFS pool reservation refused";
+ zero64(EQ_RMT_POOL,EQ_RMT_SPAN);
+ volatile uint64_t *guard_lo=(volatile uint64_t *)(EQ_RMT_POOL+EQ_RMT_PAGE);
+ volatile uint64_t *guard_hi=(volatile uint64_t *)(EQ_RMT_DATA+EQ_RMT_BYTES);
+ for(uint64_t i=0;i<EQ_RMT_PAGE/8;i++)guard_lo[i]=guard_hi[i]=EQ_RMT_GUARD;
+ struct eq_rmt_contract contract={EQ_RMT_MAGIC,1,EQ_RMT_POOL,EQ_RMT_SPAN,EQ_RMT_DATA,EQ_RMT_BYTES,EQ_RMT_GUARD,0};
+ contract.checksum=eq_rmt_checksum(&contract);
+ copy64(EQ_RMT_POOL,(uintptr_t)&contract,sizeof(contract));
+ __asm__ volatile("dsb sy" ::: "memory");
+ con_hex2("RMTFS","data=",(uint32_t)EQ_RMT_DATA,"size=",(uint32_t)EQ_RMT_BYTES);
+#endif
+
 	for (uint32_t i = 0; i < p->nsegs; i++) {
 		const struct payload_seg *s = &p->segs[i];
 		uintptr_t dst = s->vmaddr + pa_of_va_base;
@@ -133,6 +156,14 @@ const char *loader_boot(uintptr_t dtb)
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
 		ba->CommandLine[i] = p->cmdline[i];
+#if defined(BOARD_EQUULEUS) && defined(EQUULEUS_RMTFS_RESERVE)
+ /* Stamp only this boot's validated reservation; old shim boots lack it. */
+ const char stamp[] = " eqrmtfs_pool=156";
+ unsigned used=0;
+ while(used<BOOT_LINE_LENGTH && ba->CommandLine[used])used++;
+ if(used+sizeof(stamp)>BOOT_LINE_LENGTH)return "no room for RMTFS reservation stamp";
+ for(unsigned i=0;i<sizeof(stamp);i++)ba->CommandLine[used+i]=stamp[i];
+#endif
 	ba->memSizeActual = p->mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 

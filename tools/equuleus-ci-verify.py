@@ -12,10 +12,11 @@ def prepare(path):
     text = path.read_text()
     marker = '# EQUULEUS_REQUIRED_PATCHES'
     if marker in text:
-        new = '*/0148-*|*/0149-*|*/0150-*|*/0151-*|*/0152-*|*/0153-*|*/0154-*|*/0155-*)'
+        new = '*/0148-*|*/0149-*|*/0150-*|*/0151-*|*/0152-*|*/0153-*|*/0154-*|*/0155-*|*/0156-*)'
         if new in text:
             return
-        for old in ('*/0148-*|*/0149-*|*/0150-*|*/0151-*|*/0152-*|*/0153-*|*/0154-*)',
+        for old in ('*/0148-*|*/0149-*|*/0150-*|*/0151-*|*/0152-*|*/0153-*|*/0154-*|*/0155-*)',
+                    '*/0148-*|*/0149-*|*/0150-*|*/0151-*|*/0152-*|*/0153-*|*/0154-*)',
                     '*/0148-*|*/0149-*|*/0150-*|*/0151-*|*/0152-*|*/0153-*)',
                     '*/0148-*|*/0149-*|*/0150-*|*/0151-*|*/0152-*)',
                     '*/0148-*|*/0149-*|*/0150-*|*/0151-*)',
@@ -29,14 +30,14 @@ def prepare(path):
         raise SystemExit('Unknown build.sh patch loop; refusing to continue')
     guard = '''                # EQUULEUS_REQUIRED_PATCHES
                 case "$PATCH" in
-                    */0148-*|*/0149-*|*/0150-*|*/0151-*|*/0152-*|*/0153-*|*/0154-*|*/0155-*)
+                    */0148-*|*/0149-*|*/0150-*|*/0151-*|*/0152-*|*/0153-*|*/0154-*|*/0155-*|*/0156-*)
                         printf '%s\\n' "Required equuleus patch failed: $PATCH" "$APPLY_CHECK" >&2
                         exit 1
                         ;;
                 esac
 '''
     path.write_text(text.replace(needle, guard + needle))
-    print('0148/0149/0150/0151/0152/0153/0154/0155 patch failures are now fatal')
+    print('0148/0149/0150/0151/0152/0153/0154/0155/0156 patch failures are now fatal')
 
 
 def verify(root):
@@ -48,7 +49,7 @@ def verify(root):
         ],
         dev / 'sweet_rpmh.c': ['sweet_rpmh_bus_acquire(void)',
                                 'sweet_rpmh_bus_release(void)'],
-        dev / 'equuleus_mss.c': ['eqmss: port 0155', 'mss_hostsvc_test = mode == 10;', 'equuleus_glink_probe();', 'mss_halt_all = mode == 7;', 'equuleus_mss_stop_snapshot(', 'held idle %#x', 'mss_run_mba(void)', 'equuleus_mpss_load('],
+        dev / 'equuleus_mss.c': ['eqmss: port 0155', 'equuleus_rmtfs_preflight();', 'this boot has no shim reservation stamp', 'mss_hostsvc_test = mode == 10;', 'equuleus_glink_probe();', 'mss_halt_all = mode == 7;', 'equuleus_mss_stop_snapshot(', 'held idle %#x', 'mss_run_mba(void)', 'equuleus_mpss_load('],
         dev / 'equuleus_servreg.c': ['equuleus_servreg_start(', 'equuleus_servreg_poll(', 'msm/modem/wlan_pd'],
         dev / 'mi8_hostsvc.c': ['mi8_hostsvc_poll(', 'read-only firmware service'],
         dev / 'equuleus_glink.c': ['mi8_glink_start(', 'mi8_glink_qrtr_servers('],
@@ -64,7 +65,7 @@ def verify(root):
     kernel = root / f'fakeroot/System/Library/Kernels/kernel.{variant}.{machine}'
     symbols = subprocess.run(['nm', str(kernel)], check=True,
                              capture_output=True, text=True).stdout
-    for required in ('_equuleus_mss_probe', '_equuleus_mpss_load', '_equuleus_mss_stop_snapshot', '_equuleus_mss_halt_all', '_equuleus_glink_probe', '_mi8_glink_start', '_equuleus_servreg_start', '_equuleus_servreg_poll', '_mi8_hostsvc_start', '_mi8_hostsvc_poll'):
+    for required in ('_equuleus_mss_probe', '_equuleus_mpss_load', '_equuleus_mss_stop_snapshot', '_equuleus_mss_halt_all', '_equuleus_glink_probe', '_mi8_glink_start', '_equuleus_servreg_start', '_equuleus_servreg_poll', '_mi8_hostsvc_start', '_mi8_hostsvc_poll', '_equuleus_rmtfs_preflight'):
         if not any(line.split()[-1:] == [required] for line in symbols.splitlines()):
             raise SystemExit(f'Missing linked kernel entry point: {required}')
     print('Required source changes and linked MSS entry point verified')

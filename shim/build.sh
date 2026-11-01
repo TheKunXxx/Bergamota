@@ -19,6 +19,9 @@ case $BOARD in
 equuleus)
     DTB=${DTB:-../../device-dumps/equuleus/equuleus-live.dtb}
     CFLAGS="$CFLAGS -DBOARD_EQUULEUS"
+    if [ "${EQUULEUS_RMTFS_RESERVE:-0}" = 1 ]; then
+        CFLAGS="$CFLAGS -DEQUULEUS_RMTFS_RESERVE"
+    fi
     if [ "${EQUULEUS_XNU_BOOT:-0}" = 1 ]; then
         CFLAGS="$CFLAGS -DEQUULEUS_XNU_BOOT"
     fi
