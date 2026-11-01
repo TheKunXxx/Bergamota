@@ -1,3 +1,4 @@
+#include "equios_splash.h"
 /*
  * Milestone 2: one boot answers the questions that decide the XNU port.
  *   - CPU feature registers (16K granule, GIC sysreg interface)
@@ -372,8 +373,14 @@ static uint32_t to_us(uint64_t ticks)
 void shim_main(uint64_t dtb)
 {
 #if defined(BOARD_EQUULEUS) && defined(EQUULEUS_XNU_BOOT)
+    stage = "EquiOS splash";
+    con_clear(0xff000000u);
+    if (equios_splash_show()) {
+        __asm__ volatile("dsb sy" ::: "memory");
+        delay_ms(3000);
+    }
     stage = "equuleus xnu loader";
-    con_clear(BG_BOOT);
+    con_clear(0xff000000u);
     con_set_scale(2);
     con_str("BOARD", "equuleus XNU first boot");
     const char *error = loader_boot(dtb);

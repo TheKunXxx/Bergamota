@@ -20,3 +20,4 @@ xnu/patches/0159-equuleus-tftp-ram-replace.patch -whitespace
 xnu/patches/0160-equuleus-firmware-nested-paths.patch -whitespace
 xnu/patches/0161-equuleus-deep-mcfg-paths.patch -whitespace
 xnu/patches/0162-equuleus-probe-progress.patch -whitespace
+xnu/patches/0163-equuleus-wlfw-capability-probe.patch -whitespace
