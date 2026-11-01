@@ -9,7 +9,7 @@ with tempfile.TemporaryDirectory() as td:
  tail=(repo/'xnu/patches/0149-equuleus-mss-mba-bringup.patch').read_text().split('+++ b/bsd/dev/equuleus_mss.c\n',1)[1]
  p.write_text('\n'.join(l[1:] for l in tail.splitlines() if l.startswith('+'))+'\n')
  conf=root/'bsd/conf/files';conf.parent.mkdir(parents=True)
- conf.write_text('bsd/dev/beryllium_wlan.c\t\tstandard\nbsd/dev/equuleus_mss.c\t\tstandard\nbsd/dev/beryllium_bt_hci.c\t\tstandard\n')
+ conf.write_text(''.join('fixture/prefix%u.c\tstandard\n' % i for i in range(117))+'bsd/dev/beryllium_wlan.c\t\tstandard\nbsd/dev/equuleus_mss.c\t\tstandard\nbsd/dev/beryllium_bt_hci.c\t\tstandard\n'+''.join('fixture/suffix%u.c\tstandard\n' % i for i in range(12)))
  subprocess.run(['git','init','-q',td],check=True)
  for prefix in ['0150','0151','0152','0153']+(['0154'] if servreg else []):
   patch=next((repo/'xnu/patches').glob(prefix+'-*'))
