@@ -1,0 +1,113 @@
+diff --git a/bsd/dev/equuleus_mss.c b/bsd/dev/equuleus_mss.c
+index 3f12e8f..0f385a0 100644
+--- a/bsd/dev/equuleus_mss.c
++++ b/bsd/dev/equuleus_mss.c
+@@ -190,13 +190,42 @@ fs_name83(const char *name, uint8_t out[11])
+ 	}
+ }
+ 
+-/* An entry of a directory (first cluster; 0 = the root) by its 8.3 name. Long-name entries are skipped. */
++/* Bounded ASCII VFAT name: one 13-code-unit slot, exact match only.
++ * The existing component limit remains 8+dot+3; this handles '+' aliases. */
++static bool
++fs_lfn_match(const uint8_t *e, const char *name)
++{
++ static const uint8_t offsets[]={1,3,5,7,9,14,16,18,20,22,24,28,30};
++ size_t n=name?strlen(name):0;
++ if (!n || n>12 || e[0]!=0x41 || e[11]!=0x0f || e[12] || e[26] || e[27]) return false;
++ for (unsigned i=0;i<13;i++) {
++  unsigned value=e[offsets[i]] | (unsigned)e[offsets[i]+1]<<8;
++  if (i<n) {
++   unsigned want=(unsigned char)name[i];
++   if (value>127) return false;
++   if (value>='a' && value<='z') value-=32;
++   if (want>='a' && want<='z') want-=32;
++   if (value!=want) return false;
++  } else if (value!=(i==n?0u:0xffffu)) return false;
++ }
++ return true;
++}
++static uint8_t
++fs_name_checksum(const uint8_t *name)
++{
++ uint8_t sum=0;
++ for (unsigned i=0;i<11;i++) sum=(uint8_t)(((sum&1)?128:0)+(sum>>1)+name[i]);
++ return sum;
++}
++
++/* Directory entry by short name or one validated ASCII VFAT slot; 0 = root. */
+ static bool
+ fs_dir_find(uint32_t dir, const char *name, struct fs_file *out, void (*each)(const uint8_t *entry))
+ {
+ 	uint8_t want[11];
+ 	uint8_t *buf;
+-	bool found = false;
++	bool found = false, lfn_match = false;
++	uint8_t lfn_checksum = 0;
+ 	uint32_t cluster = dir;
+ 	uint32_t bytes = dir ? fs.cluster_bytes : fs.root_bytes;
+ 
+@@ -220,13 +249,17 @@ fs_dir_find(uint32_t dir, const char *name, struct fs_file *out, void (*each)(co
+ 				end = true;
+ 				break;
+ 			}
+-			if (e[0] == 0xe5 || e[11] == 0x0f || (e[11] & 0x08)) {
+-				continue;
++			if (e[0]==0xe5) { lfn_match=false; continue; }
++			if (e[11]==0x0f) {
++				lfn_match=fs_lfn_match(e,name); lfn_checksum=e[13]; continue;
+ 			}
++			bool long_match=lfn_match && fs_name_checksum(e)==lfn_checksum;
++			lfn_match=false;
++			if (e[11]&0x08) continue;
+ 			if (each != NULL) {
+ 				each(e);
+ 			}
+-			if (name != NULL && memcmp(e, want, 11) == 0) {
++			if (name != NULL && (memcmp(e, want, 11) == 0 || long_match)) {
+ 				out->first = e[26] | e[27] << 8;
+ 				out->size = e[28] | e[29] << 8 | e[30] << 16 | (uint32_t)e[31] << 24;
+ 				out->dir = (e[11] & 0x10) != 0;
+@@ -253,7 +286,7 @@ fs_component83(const char *p, size_t n)
+ 		unsigned char c=(unsigned char)p[i];
+ 		if (c=='.') { if (dot || !base) return false; dot=true; continue; }
+ 		if (!((c>='a' && c<='z') || (c>='A' && c<='Z') ||
+-		    (c>='0' && c<='9') || c=='_' || c=='-')) return false;
++		    (c>='0' && c<='9') || c=='_' || c=='-' || c=='+')) return false;
+ 		if (dot) { if (++ext>3) return false; } else if (++base>8) return false;
+ 	}
+ 	return base && (!dot || ext);
+@@ -274,7 +307,7 @@ fs_lookup(const char *path, struct fs_file *out)
+ 		size_t n = slash ? (size_t)(slash - path) : strlen(path);
+ 		struct fs_file f;
+ 
+-		if (++depth>8 || n >= sizeof(part) || !fs_component83(path,n)) {
++		if (++depth>24 || n >= sizeof(part) || !fs_component83(path,n)) {
+ 			return false;
+ 		}
+ 		memcpy(part, path, n);
+@@ -1909,13 +1942,13 @@ static bool eq_firmware_path(const char *p)
+ {
+  if (!p || strncmp(p,"image/",6)) return false;
+  size_t length=strlen(p); unsigned depth=1;
+- if (length>127) return false;
++ if (length>255) return false;
+  p+=6;
+  /* Only the firmware tree, never the modem's readwrite namespace. */
+  if (strchr(p,'/') && strncmp(p,"modem_pr/",9)) return false;
+  for (;;) {
+   const char *slash=strchr(p,'/'); size_t n=slash?(size_t)(slash-p):strlen(p);
+-  if (++depth>8 || !fs_component83(p,n)) return false;
++  if (++depth>24 || !fs_component83(p,n)) return false;
+   if (!slash) return true;
+   p=slash+1;
+  }
+@@ -2554,7 +2587,7 @@ equuleus_mss_probe(void)
+     if (mode == 11) { equuleus_rmtfs_preflight(); return; }
+     mss_rmtfs_test = mode == 12;
+     if (mss_rmtfs_test && !equuleus_rmtfs_prepare()) { say("eqrf: prepare refused; full reboot required\n"); return; }
+-    say("eqmss: port 0160, mode %u; GLINK mode8/9/10/12, servreg mode9/10/12, firmware services mode10/12; no Wi-Fi\n", mode);
++    say("eqmss: port 0161, mode %u; GLINK mode8/9/10/12, servreg mode9/10/12, firmware services mode10/12; no Wi-Fi\n", mode);
+     mss_w2a();
+     if (mode == 2) {
+         mss_w2bc(2);

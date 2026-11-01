@@ -3,7 +3,8 @@
 from pathlib import Path
 import subprocess,tempfile,os
 repo=Path(__file__).resolve().parents[2]
-firmware_paths=bool(os.environ.get('EQUULEUS_TEST_0160'))
+deep_mcfg=bool(os.environ.get('EQUULEUS_TEST_0161'))
+firmware_paths=deep_mcfg or bool(os.environ.get('EQUULEUS_TEST_0160'))
 tftp_replace=firmware_paths or bool(os.environ.get('EQUULEUS_TEST_0159'))
 tftp_ram=tftp_replace or bool(os.environ.get('EQUULEUS_TEST_0158'))
 rmtfs=tftp_ram or bool(os.environ.get('EQUULEUS_TEST_0157'))
@@ -16,7 +17,7 @@ with tempfile.TemporaryDirectory() as td:
  conf=root/'bsd/conf/files';conf.parent.mkdir(parents=True)
  conf.write_text(''.join('fixture/prefix%u.c\tstandard\n' % i for i in range(117))+'bsd/dev/beryllium_wlan.c\t\tstandard\nbsd/dev/equuleus_mss.c\t\tstandard\nbsd/dev/beryllium_bt_hci.c\t\tstandard\n'+''.join('fixture/suffix%u.c\tstandard\n' % i for i in range(12)))
  subprocess.run(['git','init','-q',td],check=True)
- for prefix in ['0150','0151','0152','0153']+(['0154'] if servreg else [])+(['0155'] if hostsvc else [])+(['0156','0157'] if rmtfs else [])+(['0158'] if tftp_ram else [])+(['0159'] if tftp_replace else [])+(['0160'] if firmware_paths else []):
+ for prefix in ['0150','0151','0152','0153']+(['0154'] if servreg else [])+(['0155'] if hostsvc else [])+(['0156','0157'] if rmtfs else [])+(['0158'] if tftp_ram else [])+(['0159'] if tftp_replace else [])+(['0160'] if firmware_paths else [])+(['0161'] if deep_mcfg else []):
   patch=next((repo/'xnu/patches').glob(prefix+'-*'))
   subprocess.run(['git','apply','--check',str(patch)],cwd=root,check=True)
   subprocess.run(['git','apply',str(patch)],cwd=root,check=True)
@@ -183,7 +184,7 @@ static bool assign_mem(const char *name,uint32_t pa,uint32_t n,uint64_t *owners,
  subprocess.run([str(exe)],check=True,env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0'})
  print('Actual equuleus adapter: bounded probe, missing/overlapping/out-of-range items, fatal DSP, read failure and write allowlist checks passed')
  if rmtfs:
-  print(('0160' if firmware_paths else '0159' if tftp_replace else '0158' if tftp_ram else '0157')+' actual modified GLINK adapter compiled and checked: bounds, deadline and missing-prepared-RMTFS refusal')
+  print(('0161' if deep_mcfg else '0160' if firmware_paths else '0159' if tftp_replace else '0158' if tftp_ram else '0157')+' actual modified GLINK adapter compiled and checked: bounds, deadline and missing-prepared-RMTFS refusal')
   raise SystemExit(0)
  gate=source[source.index('void\nequuleus_mss_probe(void)'):].split('#endif',1)[0]
  prefix=r'''
