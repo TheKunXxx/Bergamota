@@ -4,6 +4,7 @@ cd "$(dirname "$0")/.."
 test "$(git branch --show-current)" = port/equuleus
 python3 tools/tests/test-equuleus-wlfw-cap.py
 python3 tools/tests/test-equios-splash.py
+python3 tools/tests/test-shim-addresses.py
 EQUULEUS_TEST_0163=1 python3 tools/tests/test-equuleus-glink.py
 if [ -s xnu/out/equuleus-tftp-0162.payload ]; then
     BOARD=equuleus EQUULEUS_XNU_BOOT=1 EQUULEUS_RMTFS_RESERVE=1 bash shim/build.sh ../xnu/out/equuleus-tftp-0162.payload

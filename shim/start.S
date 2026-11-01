@@ -16,20 +16,34 @@ _head:
 	.ascii	"ARM\x64"		/* magic */
 	.long	0			/* res5 (PE offset) */
 
+/* Full-range position-relative addresses. Literal stores a link-time delta,
+ * never an absolute pointer; local ADR remains within a few instructions.
+ * x9 is scratch. No fixed runtime address; the normal aligned Image load applies. */
+.macro shim_address reg, symbol
+	adr	\reg, .Laddr\@
+	ldr	x9, [\reg]
+	add	\reg, \reg, x9
+	b	.Laddr_done\@
+	.balign	8
+.Laddr\@:
+	.quad	\symbol - .
+.Laddr_done\@:
+.endm
+
 	.text
 	.globl _start
 _start:
 	msr	daifset, #0xf
 	mov	x19, x0			/* DTB pointer from ABL */
 	msr	spsel, #1
-	adr	x1, _stack_top
+	shim_address x1, _stack_top
 	mov	sp, x1
-	adr	x1, vectors
+	shim_address x1, vectors
 	msr	vbar_el1, x1
 	isb
 	/* zero .bss */
-	adr	x1, _bss_start
-	adr	x2, _bss_end
+	shim_address x1, _bss_start
+	shim_address x2, _bss_end
 1:	cmp	x1, x2
 	b.hs	2f
 	str	xzr, [x1], #8
@@ -44,11 +58,11 @@ _start:
 secondary_entry:
 	msr	daifset, #0xf
 	msr	spsel, #1
-	adr	x1, _sec_stacks
+	shim_address x1, _sec_stacks
 	add	x1, x1, x0, lsl #12
 	add	x1, x1, #0x1000
 	mov	sp, x1
-	adr	x1, vectors
+	shim_address x1, vectors
 	msr	vbar_el1, x1
 	isb
 	bl	secondary_main
