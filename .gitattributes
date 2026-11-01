@@ -16,3 +16,4 @@ tools/patches/0156-equuleus-rmtfs-shim.patch -whitespace
 xnu/patches/0157-equuleus-rmtfs-ram-service.patch -whitespace
 
 xnu/patches/0158-equuleus-tftp-ram-store.patch -whitespace
+xnu/patches/0159-equuleus-tftp-ram-replace.patch -whitespace
