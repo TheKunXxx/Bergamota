@@ -1,0 +1,136 @@
+--- a/bsd/dev/equuleus_wlfw_probe.h
++++ b/bsd/dev/equuleus_wlfw_probe.h
+@@ -1,45 +1,76 @@
+ /* SPDX-License-Identifier: APSL-2.0
+- * Capability-only diagnostic; no MSA sharing or WLAN mode writes.
+- * Wire IDs verified against pinned dipper-xnu 4e82c709 mi8_wlfw.c. */
++ * 0164: register WLFW indications before probing capabilities.
++ * Registration fields/status bits follow pinned dipper-xnu's mi8_wlfw.c/v01.
++ * This diagnostic does not assign MSA memory, download BDF, or enable WLAN.
++ */
+ #ifndef EQUULEUS_WLFW_PROBE_H
+ #define EQUULEUS_WLFW_PROBE_H
+ #include "equuleus_glink.h"
+ #include <string.h>
+-#define EQ_WLFW_SERVICE 69u /* 0x45, NOT decimal45 */
++#define EQ_WLFW_SERVICE 69u
++#define EQ_WLFW_REGISTER 0x20u
++#define EQ_WLFW_CAP 0x24u
++#define EQ_WLFW_READY 2ull
+ struct eq_wlfw_probe {
+  const struct redwood_qrtr_ops *ops; struct redwood_qrtr_port *p;
+  void (*log)(void *,const char *,...); void *ctx;
+- uint32_t node,port; uint16_t txn,result,error;
+- uint64_t sent_at; unsigned attempts,rejected,send_errors,tlvs;
+- bool present,pending,answered,success;
++ uint32_t node,port; uint16_t txn,message,result,error;
++ uint64_t sent_at,fw_status;
++ unsigned attempts,reg_attempts,cap_attempts,rejected,send_errors,tlvs,indications;
++ bool present,pending,answered,success,registered,registration_done,status_valid,fw_ready;
+ };
+ static unsigned eq_wlfw_u16(const uint8_t *p){return p[0]|(unsigned)p[1]<<8;}
++static uint64_t eq_wlfw_u64(const uint8_t *p){uint64_t v=0;for(unsigned i=0;i<8;i++)v|=(uint64_t)p[i]<<(8*i);return v;}
++static void eq_wlfw_reset_peer(struct eq_wlfw_probe *w)
++{
++ w->pending=w->answered=w->success=w->registered=w->registration_done=false;
++ w->status_valid=w->fw_ready=false;w->fw_status=0;
++ w->reg_attempts=w->cap_attempts=0;
++}
+ static void eq_wlfw_server(void *ctx,bool up,uint32_t service,uint32_t version,uint32_t instance,uint32_t node,uint32_t port)
+ {
+  struct eq_wlfw_probe *w=ctx;
+  if(service!=EQ_WLFW_SERVICE || version!=1 || instance || node || !port || port>=0xfffffffeu)return;
+- if(!up){if(w->present && w->node==node && w->port==port){w->present=false;w->pending=false;w->answered=false;w->success=false;}return;}
+- if(w->present && (w->node!=node || w->port!=port))return;
+- w->present=true;w->node=node;w->port=port;
++ if(!up){if(w->present && w->node==node && w->port==port){w->present=false;eq_wlfw_reset_peer(w);}return;}
++ if(w->present)return; /* do not reset state on duplicate announcements */
++ eq_wlfw_reset_peer(w);w->present=true;w->node=node;w->port=port;
+  if(w->log)w->log(w->ctx,"eqwl: WLFW service=69/0x45 v1 instance0 peer=%u:%u\n",node,port);
+ }
+ static void eq_wlfw_receive(void *ctx,uint32_t node,uint32_t port,const void *data,size_t n)
+ {
+- struct eq_wlfw_probe *w=ctx; const uint8_t *p=data; bool seen[256]={0};
+- unsigned at=7,result=0,error=0,count=0;
+- if(!w->present || !w->pending || node!=w->node || port!=w->port || !p || n<7 || n>512 || p[0]!=2 ||
+-    eq_wlfw_u16(p+1)!=w->txn || eq_wlfw_u16(p+3)!=0x24 || eq_wlfw_u16(p+5)!=n-7)goto bad;
++ struct eq_wlfw_probe *w=ctx;const uint8_t *p=data;bool seen[256]={0};
++ unsigned at=7,result=0,error=0,count=0;uint64_t status=0;
++ if(!w->present || node!=w->node || port!=w->port || !p || n<7 || n>512 || eq_wlfw_u16(p+5)!=n-7)goto bad;
++ unsigned message=eq_wlfw_u16(p+3);
++ if(p[0]==4){
++  /* FW_READY and MSA_READY have empty payloads in this protocol version. */
++  if((message!=0x21 && message!=0x2b) || n!=7 || (!w->registered && !(w->pending && w->message==EQ_WLFW_REGISTER)))goto bad;
++  w->indications++;if(message==0x21)w->fw_ready=true;
++  if(w->log)w->log(w->ctx,"eqwl: indication msg=%#x FW_READY=%u\n",message,w->fw_ready?1u:0u);
++  return;
++ }
++ if(p[0]!=2 || !w->pending || eq_wlfw_u16(p+1)!=w->txn || message!=w->message)goto bad;
+  while(at<n){
+   if(n-at<3)goto bad;
+   unsigned tag=p[at],len=eq_wlfw_u16(p+at+1);at+=3;
+   if(seen[tag] || len>n-at)goto bad;
+   seen[tag]=true;count++;
+   if(tag==2){if(len!=4)goto bad;result=eq_wlfw_u16(p+at);error=eq_wlfw_u16(p+at+2);if(result>1 || (!result && error))goto bad;}
++  if(message==EQ_WLFW_REGISTER && tag==0x10){if(len!=8)goto bad;status=eq_wlfw_u64(p+at);}
+   at+=len;
+  }
+  if(!seen[2])goto bad;
+- w->pending=false;w->answered=true;w->result=result;w->error=error;w->success=!result;w->tlvs=count;
+- if(w->log)w->log(w->ctx,"eqwl: CAP response result=%u qmi_error=%u tlvs=%u success=%u\n",result,error,count,w->success?1u:0u);
++ w->pending=false;w->result=result;w->error=error;w->tlvs=count;
++ if(message==EQ_WLFW_REGISTER){
++  w->registration_done=true;w->registered=!result;
++  w->status_valid=!result && seen[0x10];w->fw_status=w->status_valid?status:0;
++  w->fw_ready=w->registered && (w->fw_ready || (w->fw_status & EQ_WLFW_READY)!=0);
++  if(w->log)w->log(w->ctx,"eqwl: REGISTER response result=%u qmi_error=%u status_valid=%u fw_status=%#llx FW_READY=%u\n",result,error,w->status_valid?1u:0u,w->fw_status,w->fw_ready?1u:0u);
++  if(w->registered && !w->fw_ready && w->log)w->log(w->ctx,"eqwl: waiting for FW_READY; MSA setup intentionally not implemented in 0164\n");
++ }else{
++  w->answered=true;w->success=!result;
++  if(w->log)w->log(w->ctx,"eqwl: CAP response result=%u qmi_error=%u tlvs=%u success=%u\n",result,error,count,w->success?1u:0u);
++ }
+  return;
+ bad:w->rejected++;
+ }
+@@ -54,20 +85,31 @@
+ static void eq_wlfw_poll(struct eq_wlfw_probe *w,uint64_t now,bool wlan_up)
+ {
+  if(!w->p || !w->present || !wlan_up || w->answered)return;
+- if(w->attempts && now-w->sent_at<2000000ull)return;
+- if(w->attempts>=3){w->pending=false;return;}
+- uint8_t request[7]={0};w->txn=(uint16_t)(0x163+w->attempts);w->attempts++;
+- request[1]=(uint8_t)w->txn;request[2]=(uint8_t)(w->txn>>8);request[3]=0x24;
+- w->pending=true;w->sent_at=now;
+- int r=w->ops->send(w->p,w->node,w->port,request,sizeof(request));
+- if(r){w->send_errors++;w->pending=false;}
+- if(w->log)w->log(w->ctx,"eqwl: CAP request txn=%u attempt=%u send=%d\n",w->txn,w->attempts,r);
++ if(w->pending){if(now-w->sent_at<2000000ull)return;w->pending=false;}
++ unsigned message=w->registered?EQ_WLFW_CAP:EQ_WLFW_REGISTER;
++ if(message==EQ_WLFW_REGISTER && w->registration_done)return;
++ if(message==EQ_WLFW_CAP && !w->fw_ready)return;
++ unsigned *attempts=message==EQ_WLFW_REGISTER?&w->reg_attempts:&w->cap_attempts;
++ if(*attempts>=3 || (*attempts && now-w->sent_at<2000000ull))return;
++ /* Same registration fields as dipper/icnss: FW_READY, MSA_READY, pin result,
++  * client_id KNEL, rejuvenation notifications. No HOST_CAP on SDM845 icnss. */
++ uint8_t request[33]={0};size_t n=7;
++ if(message==EQ_WLFW_REGISTER){
++  const uint8_t fields[]={0x10,1,0,1,0x13,1,0,1,0x14,1,0,1,0x15,4,0,0x4c,0x45,0x4e,0x4b,0x19,4,0,1,0,0,0};
++  memcpy(request+7,fields,sizeof(fields));n+=sizeof(fields);
++ }
++ w->txn++;if(!w->txn)w->txn++;w->message=(uint16_t)message;
++ request[1]=(uint8_t)w->txn;request[2]=(uint8_t)(w->txn>>8);request[3]=(uint8_t)message;request[5]=(uint8_t)(n-7);
++ (*attempts)++;w->attempts++;w->pending=true;w->sent_at=now;
++ unsigned attempt=*attempts;
++ int r=w->ops->send(w->p,w->node,w->port,request,n);
++ if(r && w->pending){w->send_errors++;w->pending=false;}
++ if(w->log)w->log(w->ctx,"eqwl: %s request txn=%u attempt=%u send=%d\n",message==EQ_WLFW_REGISTER?"REGISTER":"CAP",w->txn,attempt,r);
+ }
+ static void eq_wlfw_stop(struct eq_wlfw_probe *w)
+ {
+  if(w->p){w->ops->close(w->p);w->p=NULL;}
+- if(w->log)w->log(w->ctx,"eqwl: summary present=%u answered=%u success=%u attempts=%u result=%u qmi_error=%u rejected=%u send_errors=%u\n",
+-  w->present?1u:0u,w->answered?1u:0u,w->success?1u:0u,w->attempts,w->result,w->error,w->rejected,w->send_errors);
++ if(w->log)w->log(w->ctx,"eqwl: summary present=%u registered=%u FW_READY=%u status_valid=%u fw_status=%#llx cap_answered=%u success=%u attempts=%u result=%u qmi_error=%u rejected=%u send_errors=%u indications=%u\n",w->present?1u:0u,w->registered?1u:0u,w->fw_ready?1u:0u,w->status_valid?1u:0u,w->fw_status,w->answered?1u:0u,w->success?1u:0u,w->attempts,w->result,w->error,w->rejected,w->send_errors,w->indications);
+  w->pending=false;
+ }
+ #endif
