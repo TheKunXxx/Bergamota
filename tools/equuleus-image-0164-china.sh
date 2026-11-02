@@ -16,7 +16,6 @@ gh run download "$run_id" --repo TheKunXxx/Bergamota --name xnu-kernel --dir "$o
 python3 tools/mkpayload.py "$out/kernel.development.sweet" xnu/out/equuleus-native.adt xnu/out/equuleus-wlfw-0164-china.payload --cmdline "debug=0x14e serial=3 cpus=8 keepsyms=1 rd=ufsroot0 ufsroot=win ufsrw=1 rootrw=1 sweetlog=1 sweetfb_native=1 sweetfb_scale=0 sweetfb_noconsole=1 sweetsample=- unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin wdt=-1 sweettouch=5 sweettouchdelay=90 sweetkeys=1 sweetusb=0 sweetbattery=0 sweetgpu=0 sweetwlan=4 sweetwlandelay=120 sweetmss=12"
 BOARD=equuleus EQUULEUS_XNU_BOOT=1 EQUULEUS_RMTFS_RESERVE=1 EQUULEUS_SPLASH=1 bash shim/build.sh ../xnu/out/equuleus-wlfw-0164-china.payload
 cp shim/out/shim-boot.img "$destination/equuleus-wlfw-0164-china.img"
-cp "$destination/equuleus-wlfw-0164-china.img" /mnt/c/Users/TheKunX-Pro/Documents/Codex/2026-11-02/https-chatgpt-com-share-6ae7b2d3-a630/outputs/equuleus-wlfw-0164-china.img
 sha256sum "$destination/equuleus-wlfw-0164-china.img"
 ls -lh "$destination/equuleus-wlfw-0164-china.img"
 echo "Ready for temporary fastboot boot; no device partitions changed."
