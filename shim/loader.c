@@ -112,6 +112,16 @@ const char *loader_boot(uintptr_t dtb)
        p->phys_base,p->mem_size,FB_BASE,(uint64_t)FB_STRIDE*FB_H) ||
      !eq_rmt_fdt_usable((const uint8_t *)dtb,dt_size))
   return "RMTFS pool reservation refused";
+ /* Diagnostic only: leave the candidate untouched until the MSA stage. */
+ const uint64_t msa_base = 0xa8300000ull, msa_size = 0x100000ull;
+ const int msa_ranges_ok =
+     !eq_rmt_overlap(msa_base,msa_size,EQ_RMT_POOL,EQ_RMT_SPAN) &&
+     !eq_rmt_overlap(msa_base,msa_size,rd_start,rd_end-rd_start) &&
+     !eq_rmt_overlap(msa_base,msa_size,dtb,dt_size) &&
+     !eq_rmt_overlap(msa_base,msa_size,(uintptr_t)_head,(uintptr_t)_end-(uintptr_t)_head) &&
+     !eq_rmt_overlap(msa_base,msa_size,p->phys_base,p->mem_size) &&
+     !eq_rmt_overlap(msa_base,msa_size,FB_BASE,(uint64_t)FB_STRIDE*FB_H) &&
+     eq_fdt_range_usable((const uint8_t *)dtb,dt_size,msa_base,msa_size);
  zero64(EQ_RMT_POOL,EQ_RMT_SPAN);
  volatile uint64_t *guard_lo=(volatile uint64_t *)(EQ_RMT_POOL+EQ_RMT_PAGE);
  volatile uint64_t *guard_hi=(volatile uint64_t *)(EQ_RMT_DATA+EQ_RMT_BYTES);
@@ -171,6 +181,11 @@ const char *loader_boot(uintptr_t dtb)
  while(used<BOOT_LINE_LENGTH && ba->CommandLine[used])used++;
  if(used+sizeof(stamp)>BOOT_LINE_LENGTH)return "no room for RMTFS reservation stamp";
  for(unsigned i=0;i<sizeof(stamp);i++)ba->CommandLine[used+i]=stamp[i];
+ used += sizeof(stamp)-1;
+ char msa_report[] = " eqmsa_preflight=0";
+ if (msa_ranges_ok) msa_report[sizeof(msa_report)-2] = '1';
+ if (used+sizeof(msa_report)<=BOOT_LINE_LENGTH)
+  for(unsigned i=0;i<sizeof(msa_report);i++)ba->CommandLine[used+i]=msa_report[i];
 #endif
 	ba->memSizeActual = p->mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);

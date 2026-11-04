@@ -13,12 +13,12 @@ static int eq_text(const uint8_t *p,size_t n,const char *s)
  size_t i=0;while(s[i]) {if(i>=n || p[i]!=(uint8_t)s[i])return 0;i++;}
  return i<n && p[i]==0;
 }
-static int eq_rmt_fdt_usable(const uint8_t *f,size_t available)
+static int eq_fdt_range_usable(const uint8_t *f,size_t available,uint64_t base,uint64_t span)
 {
  uint32_t total,off,sz,strings,ss,res;size_t at,end;
  unsigned depth=0,root_ac=2,root_sc=1,res_ac=2,res_sc=1;
  int memory=0,reserved=0,inside=0,saw_end=0;
- if (!f || available<40 || eq_be32(f)!=0xd00dfeedu) return 0;
+ if (!span || base>UINT64_MAX-span || !f || available<40 || eq_be32(f)!=0xd00dfeedu) return 0;
  total=eq_be32(f+4);off=eq_be32(f+8);strings=eq_be32(f+12);res=eq_be32(f+16);
  ss=eq_be32(f+32);sz=eq_be32(f+36);
  if (total>available || total<40 || total>0x1000000 || eq_be32(f+20)!=17 ||
@@ -30,7 +30,7 @@ static int eq_rmt_fdt_usable(const uint8_t *f,size_t available)
   if(at>total || total-at<16 || eq_rmt_overlap(at,16,off,sz) || eq_rmt_overlap(at,16,strings,ss))return 0;
   uint64_t a=eq_be64(f+at),n=eq_be64(f+at+8);
   if(!a && !n)break;
-  if(eq_rmt_overlap(EQ_RMT_POOL,EQ_RMT_SPAN,a,n))return 0;
+  if(eq_rmt_overlap(base,span,a,n))return 0;
  }
  at=off;end=(size_t)off+sz;
  while(at<end) {
@@ -67,8 +67,8 @@ static int eq_rmt_fdt_usable(const uint8_t *f,size_t available)
     for(unsigned i=0;i<n;i+=16) {
      uint64_t a=eq_be64(v+i),s=eq_be64(v+i+8);
      if(a>UINT64_MAX-s)return 0;
-     if(depth==2){if(a<=EQ_RMT_POOL && s>=EQ_RMT_SPAN && EQ_RMT_POOL-a<=s-EQ_RMT_SPAN)inside=1;}
-     else if(eq_rmt_overlap(EQ_RMT_POOL,EQ_RMT_SPAN,a,s))return 0;
+     if(depth==2){if(a<=base && s>=span && base-a<=s-span)inside=1;}
+     else if(eq_rmt_overlap(base,span,a,s))return 0;
     }
    }
    at=(at+n+3)&~(size_t)3;if(at>end)return 0;
@@ -76,4 +76,9 @@ static int eq_rmt_fdt_usable(const uint8_t *f,size_t available)
   else if(token!=4)return 0;
  }
  return saw_end && inside && root_ac==2 && root_sc==2;
+}
+
+static int eq_rmt_fdt_usable(const uint8_t *f,size_t available)
+{
+ return eq_fdt_range_usable(f,available,EQ_RMT_POOL,EQ_RMT_SPAN);
 }
