@@ -1,0 +1,77 @@
+--- a/bsd/dev/equuleus_wlfw_probe.h
++++ b/bsd/dev/equuleus_wlfw_probe.h
+@@ -25,11 +25,13 @@
+  uint32_t node,port; uint16_t txn,message,result,error;
+  uint64_t sent_at,fw_status;
+  unsigned attempts,reg_attempts,cap_attempts,rejected,send_errors,tlvs,indications;
+- bool msa_probe,msa_assign,msa_layout_ok,msa_attempted,msa_assigned;
++ bool msa_probe,msa_assign,msa_layout_ok,msa_attempted,msa_assigned,msa_ready_ack;
+  unsigned ready_attempts;
+  bool present,pending,answered,success,registered,registration_done,status_valid,fw_ready;
+ };
+ static unsigned eq_wlfw_u16(const uint8_t *p){return p[0]|(unsigned)p[1]<<8;}
++static uint32_t eq_wlfw_u32(const uint8_t *p)
++{ return (uint32_t)eq_wlfw_u16(p)|((uint32_t)eq_wlfw_u16(p+2)<<16); }
+ static uint64_t eq_wlfw_u64(const uint8_t *p){uint64_t v=0;for(unsigned i=0;i<8;i++)v|=(uint64_t)p[i]<<(8*i);return v;}
+ /* TLV 0x03: u8 count followed by up to two packed 13-byte regions. */
+ static bool eq_wlfw_msa_regions(const uint8_t *p,unsigned n)
+@@ -52,7 +54,7 @@
+  w->pending=w->answered=w->success=w->registered=w->registration_done=false;
+  w->status_valid=w->fw_ready=false;w->fw_status=0;
+  w->reg_attempts=w->cap_attempts=w->ready_attempts=0;
+- w->msa_layout_ok=w->msa_assigned=false;
++ w->msa_layout_ok=w->msa_assigned=w->msa_ready_ack=false;
+ }
+ static void eq_wlfw_server(void *ctx,bool up,uint32_t service,uint32_t version,uint32_t instance,uint32_t node,uint32_t port)
+ {
+@@ -68,6 +70,7 @@
+  struct eq_wlfw_probe *w=ctx;const uint8_t *p=data;bool seen[256]={0};
+  unsigned at=7,result=0,error=0,count=0;uint64_t status=0;
+  const uint8_t *regions=NULL; unsigned region_bytes=0;
++ uint32_t chip=0,family=0,board=0,soc=0,fw=0;
+  if(!w->present || node!=w->node || port!=w->port || !p || n<7 || n>512 || eq_wlfw_u16(p+5)!=n-7)goto bad;
+  unsigned message=eq_wlfw_u16(p+3);
+  if(p[0]==4){
+@@ -86,6 +89,12 @@
+   if(tag==2){if(len!=4)goto bad;result=eq_wlfw_u16(p+at);error=eq_wlfw_u16(p+at+2);if(result>1 || (!result && error))goto bad;}
+   if(message==EQ_WLFW_REGISTER && tag==0x10){if(len!=8)goto bad;status=eq_wlfw_u64(p+at);}
+   if(message==EQ_WLFW_MSA_INFO && tag==3){regions=p+at;region_bytes=len;}
++  if(message==EQ_WLFW_CAP){
++   if(tag==0x10){if(len!=8)goto bad;chip=eq_wlfw_u32(p+at);family=eq_wlfw_u32(p+at+4);}
++   if(tag==0x11){if(len!=4)goto bad;board=eq_wlfw_u32(p+at);}
++   if(tag==0x12){if(len!=4)goto bad;soc=eq_wlfw_u32(p+at);}
++   if(tag==0x13){if(len<4)goto bad;fw=eq_wlfw_u32(p+at);}
++  }
+   at+=len;
+  }
+  if(!seen[2])goto bad;
+@@ -120,10 +129,16 @@
+      (unsigned long long)eq_wlfw_u64(r),eq_wlfw_u16(r+8)|(eq_wlfw_u16(r+10)<<16),(unsigned)r[12]);
+   }
+  }else if(message==EQ_WLFW_MSA_READY){
+-  w->answered=true;w->success=!result;
++  w->msa_ready_ack=!result;
++  w->answered=!!result;w->success=false;
++  if(!result)w->cap_attempts=0;
+   if(w->log)w->log(w->ctx,"eqwl: MSA_READY response result=%u qmi_error=%u\n",result,error);
+  }else{
+   w->answered=true;w->success=!result;
++  if(!result && w->log)w->log(w->ctx,
++    "eqwl: CAP ids chip=%#x family=%#x board=%#x soc=%#x fw=%#x present=%#x\n",
++    chip,family,board,soc,fw,(seen[0x10]?1u:0u)|(seen[0x11]?2u:0u)|
++    (seen[0x12]?4u:0u)|(seen[0x13]?8u:0u));
+   if(w->log)w->log(w->ctx,"eqwl: CAP response result=%u qmi_error=%u tlvs=%u success=%u\n",result,error,count,w->success?1u:0u);
+  }
+  return;
+@@ -162,9 +177,9 @@
+   w->success=false;
+  }
+  if(w->pending){if(now-w->sent_at<2000000ull)return;w->pending=false;}
+- unsigned message=w->registered?(w->msa_probe?(w->msa_assigned?EQ_WLFW_MSA_READY:EQ_WLFW_MSA_INFO):EQ_WLFW_CAP):EQ_WLFW_REGISTER;
++ unsigned message=w->registered?(w->msa_probe?(w->msa_ready_ack?EQ_WLFW_CAP:(w->msa_assigned?EQ_WLFW_MSA_READY:EQ_WLFW_MSA_INFO)):EQ_WLFW_CAP):EQ_WLFW_REGISTER;
+  if(message==EQ_WLFW_REGISTER && w->registration_done)return;
+- if(message==EQ_WLFW_CAP && !w->fw_ready)return;
++ if(message==EQ_WLFW_CAP && !w->fw_ready && !w->msa_ready_ack)return;
+  unsigned *attempts=message==EQ_WLFW_REGISTER?&w->reg_attempts:&w->cap_attempts;
+  if(message==EQ_WLFW_MSA_READY){
+   if(w->ready_attempts)return;
