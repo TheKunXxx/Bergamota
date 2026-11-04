@@ -1,0 +1,118 @@
+--- a/bsd/dev/equuleus_wlfw_probe.h
++++ b/bsd/dev/equuleus_wlfw_probe.h
+@@ -8,6 +8,10 @@
+ #include "equuleus_glink.h"
+ #include <string.h>
+ #include <pexpert/pexpert.h>
++/* Reuse the modem's existing SCM MP_ASSIGN transport. */
++static bool assign_owners(const char *,uint32_t,uint32_t,uint64_t *,uint64_t);
++#define EQ_WLFW_MSA_READY 0x2eu
++#define EQ_WLFW_MSA_SECURE_BYTES 0x4000u
+ #define EQ_WLFW_MSA_INFO 0x2du
+ #define EQ_WLFW_MSA_BASE 0xa8300000ull
+ #define EQ_WLFW_MSA_BYTES 0x100000u
+@@ -21,7 +25,8 @@
+  uint32_t node,port; uint16_t txn,message,result,error;
+  uint64_t sent_at,fw_status;
+  unsigned attempts,reg_attempts,cap_attempts,rejected,send_errors,tlvs,indications;
+- bool msa_probe;
++ bool msa_probe,msa_assign,msa_layout_ok,msa_attempted,msa_assigned;
++ unsigned ready_attempts;
+  bool present,pending,answered,success,registered,registration_done,status_valid,fw_ready;
+ };
+ static unsigned eq_wlfw_u16(const uint8_t *p){return p[0]|(unsigned)p[1]<<8;}
+@@ -46,7 +51,8 @@
+ {
+  w->pending=w->answered=w->success=w->registered=w->registration_done=false;
+  w->status_valid=w->fw_ready=false;w->fw_status=0;
+- w->reg_attempts=w->cap_attempts=0;
++ w->reg_attempts=w->cap_attempts=w->ready_attempts=0;
++ w->msa_layout_ok=w->msa_assigned=false;
+ }
+ static void eq_wlfw_server(void *ctx,bool up,uint32_t service,uint32_t version,uint32_t instance,uint32_t node,uint32_t port)
+ {
+@@ -95,11 +101,27 @@
+   w->success=!result && eq_wlfw_msa_regions(regions,region_bytes);
+   if(w->log)w->log(w->ctx,"eqwl: MSA_INFO result=%u qmi_error=%u valid=%u regions=%u\n",
+     result,error,w->success?1u:0u,w->success?(unsigned)regions[0]:0u);
++  if(w->success && w->msa_assign && regions[0]==2){
++   const uint8_t *first=regions+1, *second=regions+14;
++   const uint8_t *secure=first[12]?first:second;
++   const uint8_t *normal=first[12]?second:first;
++   /* Require the precise two-region layout measured on this device. */
++   w->msa_layout_ok=secure[12]==1 && normal[12]==0 &&
++    eq_wlfw_u64(secure)==EQ_WLFW_MSA_BASE &&
++    eq_wlfw_u64(normal)==EQ_WLFW_MSA_BASE+EQ_WLFW_MSA_SECURE_BYTES &&
++    (eq_wlfw_u16(secure+8)|(eq_wlfw_u16(secure+10)<<16))==EQ_WLFW_MSA_SECURE_BYTES &&
++    (eq_wlfw_u16(normal+8)|(eq_wlfw_u16(normal+10)<<16))==EQ_WLFW_MSA_BYTES-EQ_WLFW_MSA_SECURE_BYTES;
++   if(w->msa_layout_ok)w->answered=false;
++  }
++  if(w->msa_assign && w->log)w->log(w->ctx,"eqwl: MSA assign layout=%u\n",w->msa_layout_ok?1u:0u);
+   if(w->success && w->log)for(unsigned i=0;i<regions[0];i++){
+    const uint8_t *r=regions+1+13*i;
+    w->log(w->ctx,"eqwl: MSA region %u addr=%#llx bytes=%u secure=%u\n",i,
+      (unsigned long long)eq_wlfw_u64(r),eq_wlfw_u16(r+8)|(eq_wlfw_u16(r+10)<<16),(unsigned)r[12]);
+   }
++ }else if(message==EQ_WLFW_MSA_READY){
++  w->answered=true;w->success=!result;
++  if(w->log)w->log(w->ctx,"eqwl: MSA_READY response result=%u qmi_error=%u\n",result,error);
+  }else{
+   w->answered=true;w->success=!result;
+   if(w->log)w->log(w->ctx,"eqwl: CAP response result=%u qmi_error=%u tlvs=%u success=%u\n",result,error,count,w->success?1u:0u);
+@@ -113,6 +135,8 @@
+  unsigned stamp=0,probe=0;
+  w->msa_probe=PE_parse_boot_argn("eqmsa_probe",&probe,sizeof(probe)) && probe==1 &&
+     PE_parse_boot_argn("eqmsa_reserved",&stamp,sizeof(stamp)) && stamp==166;
++ unsigned assign=0;
++ w->msa_assign=w->msa_probe && PE_parse_boot_argn("eqmsa_assign",&assign,sizeof(assign)) && assign==1;
+  if(!ops || !ops->open || !ops->lookup || !ops->send || !ops->close)return false;
+  w->p=ops->open(eq_wlfw_receive,eq_wlfw_server,w);if(!w->p)return false;
+  int r=ops->lookup(w->p,EQ_WLFW_SERVICE,1,0);
+@@ -121,11 +145,31 @@
+ static void eq_wlfw_poll(struct eq_wlfw_probe *w,uint64_t now,bool wlan_up)
+ {
+  if(!w->p || !w->present || !wlan_up || w->answered)return;
++ if(w->msa_attempted && !w->msa_assigned)return;
++ if(w->msa_layout_ok && !w->msa_attempted){
++  const uint64_t wlan=(1ull<<15)|(1ull<<24); /* MSS_MSA and WLAN */
++  uint64_t secure_owners=1ull<<3,normal_owners=1ull<<3; /* HLOS */
++  w->msa_attempted=true;
++  bool secure_ok=assign_owners("wlfw-msa-secure",EQ_WLFW_MSA_BASE,
++      EQ_WLFW_MSA_SECURE_BYTES,&secure_owners,wlan);
++  bool normal_ok=secure_ok && assign_owners("wlfw-msa-normal",
++      EQ_WLFW_MSA_BASE+EQ_WLFW_MSA_SECURE_BYTES,
++      EQ_WLFW_MSA_BYTES-EQ_WLFW_MSA_SECURE_BYTES,&normal_owners,wlan|(1ull<<25));
++  w->msa_assigned=secure_ok && normal_ok;
++  if(w->log)w->log(w->ctx,"eqwl: MSA assign secure=%u normal=%u; retain until reboot\n",
++      secure_ok?1u:0u,normal_ok?1u:0u);
++  if(!w->msa_assigned){w->answered=true;w->success=false;return;}
++  w->success=false;
++ }
+  if(w->pending){if(now-w->sent_at<2000000ull)return;w->pending=false;}
+- unsigned message=w->registered?(w->msa_probe?EQ_WLFW_MSA_INFO:EQ_WLFW_CAP):EQ_WLFW_REGISTER;
++ unsigned message=w->registered?(w->msa_probe?(w->msa_assigned?EQ_WLFW_MSA_READY:EQ_WLFW_MSA_INFO):EQ_WLFW_CAP):EQ_WLFW_REGISTER;
+  if(message==EQ_WLFW_REGISTER && w->registration_done)return;
+  if(message==EQ_WLFW_CAP && !w->fw_ready)return;
+  unsigned *attempts=message==EQ_WLFW_REGISTER?&w->reg_attempts:&w->cap_attempts;
++ if(message==EQ_WLFW_MSA_READY){
++  if(w->ready_attempts)return;
++  attempts=&w->ready_attempts;
++ }
+  if(*attempts>=3 || (*attempts && now-w->sent_at<2000000ull))return;
+  /* Same registration fields as dipper/icnss: FW_READY, MSA_READY, pin result,
+   * client_id KNEL, rejuvenation notifications. No HOST_CAP on SDM845 icnss. */
+@@ -146,12 +190,12 @@
+  unsigned attempt=*attempts;
+  int r=w->ops->send(w->p,w->node,w->port,request,n);
+  if(r && w->pending){w->send_errors++;w->pending=false;}
+- if(w->log)w->log(w->ctx,"eqwl: %s request txn=%u attempt=%u send=%d\n",message==EQ_WLFW_REGISTER?"REGISTER":message==EQ_WLFW_MSA_INFO?"MSA_INFO":"CAP",w->txn,attempt,r);
++ if(w->log)w->log(w->ctx,"eqwl: %s request txn=%u attempt=%u send=%d\n",message==EQ_WLFW_REGISTER?"REGISTER":message==EQ_WLFW_MSA_INFO?"MSA_INFO":message==EQ_WLFW_MSA_READY?"MSA_READY":"CAP",w->txn,attempt,r);
+ }
+ static void eq_wlfw_stop(struct eq_wlfw_probe *w)
+ {
+  if(w->p){w->ops->close(w->p);w->p=NULL;}
+- if(w->log)w->log(w->ctx,"eqwl: summary present=%u registered=%u FW_READY=%u status_valid=%u fw_status=%#llx cap_answered=%u success=%u attempts=%u result=%u qmi_error=%u rejected=%u send_errors=%u indications=%u\n",w->present?1u:0u,w->registered?1u:0u,w->fw_ready?1u:0u,w->status_valid?1u:0u,w->fw_status,w->answered?1u:0u,w->success?1u:0u,w->attempts,w->result,w->error,w->rejected,w->send_errors,w->indications);
++ if(w->log)w->log(w->ctx,"eqwl: summary present=%u registered=%u FW_READY=%u status_valid=%u fw_status=%#llx last_msg=%#x answered=%u success=%u attempts=%u result=%u qmi_error=%u rejected=%u send_errors=%u indications=%u\n",w->present?1u:0u,w->registered?1u:0u,w->fw_ready?1u:0u,w->status_valid?1u:0u,w->fw_status,(unsigned)w->message,w->answered?1u:0u,w->success?1u:0u,w->attempts,w->result,w->error,w->rejected,w->send_errors,w->indications);
+  w->pending=false;
+ }
+ #endif
