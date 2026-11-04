@@ -7,8 +7,8 @@ test -s xnu/out/equuleus-native.adt
 destination=/mnt/c/Users/TheKunX-Pro/Desktop/platform-tools
 test -d "$destination"
 expected=$(git log -1 --format=%H -- xnu/patches/0169-equuleus-wlfw-power.patch)
-run_id=$(gh run list --repo TheKunXxx/Bergamota --workflow xnu.yml --branch port/equuleus --commit "$expected" --limit 1 --json databaseId --jq '.[0].databaseId // empty')
-[[ "$run_id" =~ ^[0-9]+$ ]] || { echo "No xnu workflow run for $expected yet"; exit 1; }
+run_id=$(gh run list --repo TheKunXxx/Bergamota --workflow xnu.yml --branch port/equuleus --commit "$expected" --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+[[ "$run_id" =~ ^[0-9]+$ ]] || { echo "No successful xnu workflow run for $expected yet"; exit 1; }
 gh run watch "$run_id" --repo TheKunXxx/Bergamota --exit-status
 actual=$(gh run view "$run_id" --repo TheKunXxx/Bergamota --json headSha,conclusion --jq '.headSha + " " + .conclusion')
 test "$actual" = "$expected success" || { echo "Unexpected kernel run: $actual"; exit 1; }
