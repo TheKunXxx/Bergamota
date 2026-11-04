@@ -1,0 +1,75 @@
+--- a/bsd/dev/equuleus_wlfw_probe.h
++++ b/bsd/dev/equuleus_wlfw_probe.h
+@@ -151,29 +151,58 @@
+  if(r){ops->close(w->p);w->p=NULL;return false;}return true;
+ }
+-/* Read the installed SMMUv2 stream routes without changing the shared SMMU. */
++/* Check both WLAN streams and optionally install a single legacy SMR. */
+ static bool eq_wlfw_smmu_bypass(struct eq_wlfw_probe *w)
+ {
+- w->wlan_smmu=ml_io_map(0x15000000ul,0x1000);
++ if(!w->wlan_smmu)w->wlan_smmu=ml_io_map(0x15000000ul,0x1000);
+  if(!w->wlan_smmu)return false;
+  uint32_t cr0=rd(w->wlan_smmu),id0=rd(w->wlan_smmu+0x20);
+  unsigned count=id0&0xffu;
+  if(w->log)w->log(w->ctx,"eqwl: SMMU CR0=%#x ID0=%#x groups=%u\n",cr0,id0,count);
+  if(id0==UINT32_MAX || !(id0&(1u<<27)) || !count || (cr0&1))return false;
+  const bool ext=(cr0&(1u<<3)) && (id0&(1u<<8));
+- unsigned matches[2]={0},bypass[2]={0};
+- for(unsigned i=0;i<count;i++){
+-  uint32_t smr=rd(w->wlan_smmu+0x800+4*i),s2cr=rd(w->wlan_smmu+0xc00+4*i);
+-  if(!(ext?(s2cr&(1u<<10)):(smr&(1u<<31))))continue;
+-  unsigned width=ext?0xffffu:0x7fffu;
+-  unsigned mask=(smr>>16)&width, id=smr&width;
+-  for(unsigned j=0;j<2;j++){
+-   if(((id^(0x40u+j))&~mask)!=0)continue;
+-   matches[j]++;
+-   if(((s2cr>>16)&3)==1)bypass[j]++;
+-   if(w->log)w->log(w->ctx,"eqwl: SMMU sid=%#x slot=%u SMR=%#x S2CR=%#x\n",0x40u+j,i,smr,s2cr);
++ unsigned install=0;
++ bool can_install=!ext && PE_parse_boot_argn("eqwlan_route",&install,sizeof(install)) && install==1;
++ for(unsigned pass=0;pass<2;pass++){
++  unsigned slot=count;
++  uint32_t old_s2cr=0;
++  unsigned matches[2]={0},bypass[2]={0};
++  for(unsigned i=0;i<count;i++){
++   uint32_t smr=rd(w->wlan_smmu+0x800+4*i),s2cr=rd(w->wlan_smmu+0xc00+4*i);
++   if(!(ext?(s2cr&(1u<<10)):(smr&(1u<<31)))){
++    if(slot==count && !smr && (s2cr==0 || s2cr==(2u<<16))){slot=i;old_s2cr=s2cr;}
++    continue;
++   }
++   unsigned width=ext?0xffffu:0x7fffu;
++   unsigned mask=(smr>>16)&width, id=smr&width;
++   for(unsigned j=0;j<2;j++){
++    if(((id^(0x40u+j))&~mask)!=0)continue;
++    matches[j]++;
++    if(((s2cr>>16)&3)==1)bypass[j]++;
++    if(w->log)w->log(w->ctx,"eqwl: SMMU sid=%#x slot=%u SMR=%#x S2CR=%#x\n",0x40u+j,i,smr,s2cr);
++   }
++  }
++  if(matches[0]==1 && matches[1]==1 && bypass[0]==1 && bypass[1]==1)return true;
++  if(pass || !can_install || matches[0] || matches[1] || slot==count)return false;
++  vm_offset_t smr_addr=w->wlan_smmu+0x800+4*slot;
++  vm_offset_t s2cr_addr=w->wlan_smmu+0xc00+4*slot;
++  if(rd(smr_addr)!=0 || rd(s2cr_addr)!=old_s2cr)return false;
++  /* Program bypass while the match is invalid, then publish only SID 0x40/41. */
++  wr(s2cr_addr,1u<<16);
++  __asm__ volatile("dsb sy" ::: "memory");
++  if(rd(s2cr_addr)==(1u<<16)){
++   wr(smr_addr,0x80010040u);
++   __asm__ volatile("dsb sy" ::: "memory");
++  }
++  bool installed=rd(smr_addr)==0x80010040u && rd(s2cr_addr)==(1u<<16);
++  if(w->log)w->log(w->ctx,"eqwl: SMMU route slot=%u readback=%u\n",slot,installed?1u:0u);
++  if(!installed){
++   wr(smr_addr,0);
++   __asm__ volatile("dsb sy" ::: "memory");
++   if(rd(smr_addr)==0)wr(s2cr_addr,old_s2cr);
++   return false;
+   }
+  }
+- return matches[0]==1 && matches[1]==1 && bypass[0]==1 && bypass[1]==1;
++ return false;
+ }
+ static bool eq_wlfw_power(struct eq_wlfw_probe *w)
+ {
