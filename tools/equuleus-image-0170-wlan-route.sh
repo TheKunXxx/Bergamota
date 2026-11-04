@@ -6,7 +6,7 @@ python3 tools/tests/test-shim-addresses.py
 test -s xnu/out/equuleus-native.adt
 destination=/mnt/c/Users/TheKunX-Pro/Desktop/platform-tools
 test -d "$destination"
-expected=$(git log -1 --format=%H -- xnu/patches/0170-equuleus-wlfw-route.patch)
+expected=$(git log -1 --format=%H -- xnu/patches/0170-equuleus-wlfw-route.patch .github/workflows/xnu.yml)
 run_id=$(gh run list --repo TheKunXxx/Bergamota --workflow xnu.yml --branch port/equuleus --commit "$expected" --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
 [[ "$run_id" =~ ^[0-9]+$ ]] || { echo "No successful xnu workflow run for $expected yet"; exit 1; }
 gh run watch "$run_id" --repo TheKunXxx/Bergamota --exit-status
