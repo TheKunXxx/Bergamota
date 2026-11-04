@@ -1,0 +1,100 @@
+--- a/bsd/dev/equuleus_wlfw_probe.h
++++ b/bsd/dev/equuleus_wlfw_probe.h
+@@ -27,6 +27,8 @@
+  unsigned attempts,reg_attempts,cap_attempts,rejected,send_errors,tlvs,indications;
+  bool msa_probe,msa_assign,msa_layout_ok,msa_attempted,msa_assigned,msa_ready_ack;
+  unsigned ready_attempts;
++ bool power_probe,power_attempted;
++ vm_offset_t wlan_smmu;
+  bool present,pending,answered,success,registered,registration_done,status_valid,fw_ready;
+ };
+ static unsigned eq_wlfw_u16(const uint8_t *p){return p[0]|(unsigned)p[1]<<8;}
+@@ -152,14 +154,77 @@
+     PE_parse_boot_argn("eqmsa_reserved",&stamp,sizeof(stamp)) && stamp==166;
+  unsigned assign=0;
+  w->msa_assign=w->msa_probe && PE_parse_boot_argn("eqmsa_assign",&assign,sizeof(assign)) && assign==1;
++ unsigned power=0;
++ w->power_probe=w->msa_assign && PE_parse_boot_argn("eqwlan_power",&power,sizeof(power)) && power==1;
+  if(!ops || !ops->open || !ops->lookup || !ops->send || !ops->close)return false;
+  w->p=ops->open(eq_wlfw_receive,eq_wlfw_server,w);if(!w->p)return false;
+  int r=ops->lookup(w->p,EQ_WLFW_SERVICE,1,0);
+  if(r){ops->close(w->p);w->p=NULL;return false;}return true;
+ }
++/* Read the installed SMMUv2 stream routes without changing the shared SMMU. */
++static bool eq_wlfw_smmu_bypass(struct eq_wlfw_probe *w)
++{
++ w->wlan_smmu=ml_io_map(0x15000000ul,0x1000);
++ if(!w->wlan_smmu)return false;
++ uint32_t cr0=rd(w->wlan_smmu),id0=rd(w->wlan_smmu+0x20);
++ unsigned count=id0&0xffu;
++ if(w->log)w->log(w->ctx,"eqwl: SMMU CR0=%#x ID0=%#x groups=%u\n",cr0,id0,count);
++ if(id0==UINT32_MAX || !(id0&(1u<<27)) || !count || (cr0&1))return false;
++ const bool ext=(cr0&(1u<<3)) && (id0&(1u<<8));
++ unsigned matches[2]={0},bypass[2]={0};
++ for(unsigned i=0;i<count;i++){
++  uint32_t smr=rd(w->wlan_smmu+0x800+4*i),s2cr=rd(w->wlan_smmu+0xc00+4*i);
++  if(!(ext?(s2cr&(1u<<10)):(smr&(1u<<31))))continue;
++  unsigned width=ext?0xffffu:0x7fffu;
++  unsigned mask=(smr>>16)&width, id=smr&width;
++  for(unsigned j=0;j<2;j++){
++   if(((id^(0x40u+j))&~mask)!=0)continue;
++   matches[j]++;
++   if(((s2cr>>16)&3)==1)bypass[j]++;
++   if(w->log)w->log(w->ctx,"eqwl: SMMU sid=%#x slot=%u SMR=%#x S2CR=%#x\n",0x40u+j,i,smr,s2cr);
++  }
++ }
++ return matches[0]==1 && matches[1]==1 && bypass[0]==1 && bypass[1]==1;
++}
++static bool eq_wlfw_power(struct eq_wlfw_probe *w)
++{
++ const struct {const char *name;uint32_t mv;} rails[]={
++  {"ldoa5",800},{"ldoa7",1800},{"ldoa17",1300},{"ldoa25",3300}
++ };
++ uint32_t addr[4]={0};
++ for(unsigned i=0;i<4;i++){
++  if(rail_position(rails[i].name,0,&addr[i],false)!=0 || !addr[i] ||
++     addr[i]>UINT32_MAX-8 || (addr[i]&3)){
++   if(w->log)w->log(w->ctx,"eqwl: power missing rail %s\n",rails[i].name);
++   return false;
++  }
++ }
++ for(unsigned i=0;i<4;i++){
++  const char *name=rails[i].name;
++  if(!rpmh_write(name,addr[i],rails[i].mv) ||
++     !rpmh_write(name,addr[i]+8,7) ||
++     !rpmh_write(name,addr[i]+4,1)){
++   if(w->log)w->log(w->ctx,"eqwl: power vote failed rail=%s\n",name);
++   return false;
++  }
++  delay_for_interval(1,NSEC_PER_MSEC);
++ }
++ return true;
++}
+ static void eq_wlfw_poll(struct eq_wlfw_probe *w,uint64_t now,bool wlan_up)
+ {
+- if(!w->p || !w->present || !wlan_up || w->answered)return;
++ if(!w->p || !w->present || !wlan_up)return;
++ if(w->answered){
++  if(w->power_probe && !w->power_attempted && w->msa_ready_ack &&
++     w->message==EQ_WLFW_CAP && w->success){
++   w->power_attempted=true;
++   bool route=eq_wlfw_smmu_bypass(w);
++   bool powered=route && eq_wlfw_power(w);
++   if(w->log)w->log(w->ctx,"eqwl: power SMMU_bypass=%u rails_ok=%u FW_READY=%u\n",
++       route?1u:0u,powered?1u:0u,w->fw_ready?1u:0u);
++  }
++  return;
++ }
+  if(w->msa_attempted && !w->msa_assigned)return;
+  if(w->msa_layout_ok && !w->msa_attempted){
+   const uint64_t wlan=(1ull<<15)|(1ull<<24); /* MSS_MSA and WLAN */
+@@ -209,6 +274,9 @@
+ }
+ static void eq_wlfw_stop(struct eq_wlfw_probe *w)
+ {
++ if(w->wlan_smmu && w->log)
++  w->log(w->ctx,"eqwl: SMMU final GFSR=%#x GFSYNR1=%#x\n",
++    rd(w->wlan_smmu+0x48),rd(w->wlan_smmu+0x54));
+  if(w->p){w->ops->close(w->p);w->p=NULL;}
+  if(w->log)w->log(w->ctx,"eqwl: summary present=%u registered=%u FW_READY=%u status_valid=%u fw_status=%#llx last_msg=%#x answered=%u success=%u attempts=%u result=%u qmi_error=%u rejected=%u send_errors=%u indications=%u\n",w->present?1u:0u,w->registered?1u:0u,w->fw_ready?1u:0u,w->status_valid?1u:0u,w->fw_status,(unsigned)w->message,w->answered?1u:0u,w->success?1u:0u,w->attempts,w->result,w->error,w->rejected,w->send_errors,w->indications);
+  w->pending=false;
