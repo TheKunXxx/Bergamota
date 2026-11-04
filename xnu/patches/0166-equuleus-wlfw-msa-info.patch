@@ -1,0 +1,117 @@
+--- a/bsd/dev/equuleus_wlfw_probe.h
++++ b/bsd/dev/equuleus_wlfw_probe.h
+@@ -7,6 +7,10 @@
+ #define EQUULEUS_WLFW_PROBE_H
+ #include "equuleus_glink.h"
+ #include <string.h>
++#include <pexpert/pexpert.h>
++#define EQ_WLFW_MSA_INFO 0x2du
++#define EQ_WLFW_MSA_BASE 0xa8300000ull
++#define EQ_WLFW_MSA_BYTES 0x100000u
+ #define EQ_WLFW_SERVICE 69u
+ #define EQ_WLFW_REGISTER 0x20u
+ #define EQ_WLFW_CAP 0x24u
+@@ -17,10 +21,27 @@
+  uint32_t node,port; uint16_t txn,message,result,error;
+  uint64_t sent_at,fw_status;
+  unsigned attempts,reg_attempts,cap_attempts,rejected,send_errors,tlvs,indications;
++ bool msa_probe;
+  bool present,pending,answered,success,registered,registration_done,status_valid,fw_ready;
+ };
+ static unsigned eq_wlfw_u16(const uint8_t *p){return p[0]|(unsigned)p[1]<<8;}
+ static uint64_t eq_wlfw_u64(const uint8_t *p){uint64_t v=0;for(unsigned i=0;i<8;i++)v|=(uint64_t)p[i]<<(8*i);return v;}
++/* TLV 0x03: u8 count followed by up to two packed 13-byte regions. */
++static bool eq_wlfw_msa_regions(const uint8_t *p,unsigned n)
++{
++ if(!p || !n || p[0]<1 || p[0]>2 || n!=1+13u*p[0])return false;
++ uint64_t base[2],end[2];
++ for(unsigned i=0;i<p[0];i++){
++  const uint8_t *r=p+1+13*i;
++  base[i]=eq_wlfw_u64(r);
++  uint64_t size=(uint64_t)eq_wlfw_u16(r+8)|((uint64_t)eq_wlfw_u16(r+10)<<16);
++  if(r[12]>1 || !size || base[i]<EQ_WLFW_MSA_BASE ||
++     base[i]>=EQ_WLFW_MSA_BASE+EQ_WLFW_MSA_BYTES ||
++     size>EQ_WLFW_MSA_BASE+EQ_WLFW_MSA_BYTES-base[i])return false;
++  end[i]=base[i]+size;
++ }
++ return p[0]==1 || end[0]<=base[1] || end[1]<=base[0];
++}
+ static void eq_wlfw_reset_peer(struct eq_wlfw_probe *w)
+ {
+  w->pending=w->answered=w->success=w->registered=w->registration_done=false;
+@@ -40,6 +61,7 @@
+ {
+  struct eq_wlfw_probe *w=ctx;const uint8_t *p=data;bool seen[256]={0};
+  unsigned at=7,result=0,error=0,count=0;uint64_t status=0;
++ const uint8_t *regions=NULL; unsigned region_bytes=0;
+  if(!w->present || node!=w->node || port!=w->port || !p || n<7 || n>512 || eq_wlfw_u16(p+5)!=n-7)goto bad;
+  unsigned message=eq_wlfw_u16(p+3);
+  if(p[0]==4){
+@@ -57,6 +79,7 @@
+   seen[tag]=true;count++;
+   if(tag==2){if(len!=4)goto bad;result=eq_wlfw_u16(p+at);error=eq_wlfw_u16(p+at+2);if(result>1 || (!result && error))goto bad;}
+   if(message==EQ_WLFW_REGISTER && tag==0x10){if(len!=8)goto bad;status=eq_wlfw_u64(p+at);}
++  if(message==EQ_WLFW_MSA_INFO && tag==3){regions=p+at;region_bytes=len;}
+   at+=len;
+  }
+  if(!seen[2])goto bad;
+@@ -66,7 +89,17 @@
+   w->status_valid=!result && seen[0x10];w->fw_status=w->status_valid?status:0;
+   w->fw_ready=w->registered && (w->fw_ready || (w->fw_status & EQ_WLFW_READY)!=0);
+   if(w->log)w->log(w->ctx,"eqwl: REGISTER response result=%u qmi_error=%u status_valid=%u fw_status=%#llx FW_READY=%u\n",result,error,w->status_valid?1u:0u,w->fw_status,w->fw_ready?1u:0u);
+-  if(w->registered && !w->fw_ready && w->log)w->log(w->ctx,"eqwl: waiting for FW_READY; MSA setup intentionally not implemented in 0164\n");
++  if(w->registered && !w->fw_ready && !w->msa_probe && w->log)w->log(w->ctx,"eqwl: waiting for FW_READY; MSA setup intentionally not implemented in 0164\n");
++ }else if(message==EQ_WLFW_MSA_INFO){
++  w->answered=true;
++  w->success=!result && eq_wlfw_msa_regions(regions,region_bytes);
++  if(w->log)w->log(w->ctx,"eqwl: MSA_INFO result=%u qmi_error=%u valid=%u regions=%u\n",
++    result,error,w->success?1u:0u,w->success?(unsigned)regions[0]:0u);
++  if(w->success && w->log)for(unsigned i=0;i<regions[0];i++){
++   const uint8_t *r=regions+1+13*i;
++   w->log(w->ctx,"eqwl: MSA region %u addr=%#llx bytes=%u secure=%u\n",i,
++     (unsigned long long)eq_wlfw_u64(r),eq_wlfw_u16(r+8)|(eq_wlfw_u16(r+10)<<16),(unsigned)r[12]);
++  }
+  }else{
+   w->answered=true;w->success=!result;
+   if(w->log)w->log(w->ctx,"eqwl: CAP response result=%u qmi_error=%u tlvs=%u success=%u\n",result,error,count,w->success?1u:0u);
+@@ -77,6 +110,9 @@
+ static bool eq_wlfw_start(struct eq_wlfw_probe *w,const struct redwood_qrtr_ops *ops,void (*log)(void *,const char *,...),void *ctx)
+ {
+  memset(w,0,sizeof(*w));w->ops=ops;w->log=log;w->ctx=ctx;
++ unsigned stamp=0,probe=0;
++ w->msa_probe=PE_parse_boot_argn("eqmsa_probe",&probe,sizeof(probe)) && probe==1 &&
++    PE_parse_boot_argn("eqmsa_reserved",&stamp,sizeof(stamp)) && stamp==166;
+  if(!ops || !ops->open || !ops->lookup || !ops->send || !ops->close)return false;
+  w->p=ops->open(eq_wlfw_receive,eq_wlfw_server,w);if(!w->p)return false;
+  int r=ops->lookup(w->p,EQ_WLFW_SERVICE,1,0);
+@@ -86,7 +122,7 @@
+ {
+  if(!w->p || !w->present || !wlan_up || w->answered)return;
+  if(w->pending){if(now-w->sent_at<2000000ull)return;w->pending=false;}
+- unsigned message=w->registered?EQ_WLFW_CAP:EQ_WLFW_REGISTER;
++ unsigned message=w->registered?(w->msa_probe?EQ_WLFW_MSA_INFO:EQ_WLFW_CAP):EQ_WLFW_REGISTER;
+  if(message==EQ_WLFW_REGISTER && w->registration_done)return;
+  if(message==EQ_WLFW_CAP && !w->fw_ready)return;
+  unsigned *attempts=message==EQ_WLFW_REGISTER?&w->reg_attempts:&w->cap_attempts;
+@@ -97,6 +133,12 @@
+  if(message==EQ_WLFW_REGISTER){
+   const uint8_t fields[]={0x10,1,0,1,0x13,1,0,1,0x14,1,0,1,0x15,4,0,0x4c,0x45,0x4e,0x4b,0x19,4,0,1,0,0,0};
+   memcpy(request+7,fields,sizeof(fields));n+=sizeof(fields);
++ }else if(message==EQ_WLFW_MSA_INFO){
++  request[7]=1; request[8]=8;
++  for(unsigned i=0;i<8;i++)request[10+i]=(uint8_t)(EQ_WLFW_MSA_BASE>>(8*i));
++  request[18]=2; request[19]=4;
++  for(unsigned i=0;i<4;i++)request[21+i]=(uint8_t)(EQ_WLFW_MSA_BYTES>>(8*i));
++  n=25;
+  }
+  w->txn++;if(!w->txn)w->txn++;w->message=(uint16_t)message;
+  request[1]=(uint8_t)w->txn;request[2]=(uint8_t)(w->txn>>8);request[3]=(uint8_t)message;request[5]=(uint8_t)(n-7);
+@@ -104,7 +146,7 @@
+  unsigned attempt=*attempts;
+  int r=w->ops->send(w->p,w->node,w->port,request,n);
+  if(r && w->pending){w->send_errors++;w->pending=false;}
+- if(w->log)w->log(w->ctx,"eqwl: %s request txn=%u attempt=%u send=%d\n",message==EQ_WLFW_REGISTER?"REGISTER":"CAP",w->txn,attempt,r);
++ if(w->log)w->log(w->ctx,"eqwl: %s request txn=%u attempt=%u send=%d\n",message==EQ_WLFW_REGISTER?"REGISTER":message==EQ_WLFW_MSA_INFO?"MSA_INFO":"CAP",w->txn,attempt,r);
+ }
+ static void eq_wlfw_stop(struct eq_wlfw_probe *w)
+ {

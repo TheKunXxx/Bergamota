@@ -182,10 +182,14 @@ const char *loader_boot(uintptr_t dtb)
  if(used+sizeof(stamp)>BOOT_LINE_LENGTH)return "no room for RMTFS reservation stamp";
  for(unsigned i=0;i<sizeof(stamp);i++)ba->CommandLine[used+i]=stamp[i];
  used += sizeof(stamp)-1;
- char msa_report[] = " eqmsa_preflight=0";
- if (msa_ranges_ok) msa_report[sizeof(msa_report)-2] = '1';
- if (used+sizeof(msa_report)<=BOOT_LINE_LENGTH)
-  for(unsigned i=0;i<sizeof(msa_report);i++)ba->CommandLine[used+i]=msa_report[i];
+ /* This low-RAM window lies below the kernel's handed-off RAM aperture.
+  * Leave it CPU-owned for the metadata-only MSA_INFO stage. */
+ const char msa_ok[] = " eqmsa_preflight=1 eqmsa_reserved=166";
+ const char msa_no[] = " eqmsa_preflight=0";
+ const char *msa_report = msa_ranges_ok ? msa_ok : msa_no;
+ unsigned msa_len = msa_ranges_ok ? sizeof(msa_ok) : sizeof(msa_no);
+ if (used+msa_len<=BOOT_LINE_LENGTH)
+  for(unsigned i=0;i<msa_len;i++)ba->CommandLine[used+i]=msa_report[i];
 #endif
 	ba->memSizeActual = p->mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
