@@ -1,0 +1,50 @@
+--- a/bsd/dev/equuleus_wlfw_probe.h
++++ b/bsd/dev/equuleus_wlfw_probe.h
+@@ -151,5 +151,39 @@
+  if(r){ops->close(w->p);w->p=NULL;return false;}return true;
+ }
++static void eq_wlfw_context_survey(struct eq_wlfw_probe *w)
++{
++ uint32_t id1=rd(w->wlan_smmu+0x24),id2=rd(w->wlan_smmu+0x28);
++ unsigned groups=rd(w->wlan_smmu+0x20)&0xffu;
++ unsigned count=id1&0xffu,stage2=(id1>>16)&0xffu;
++ unsigned shift=(id1&(1u<<31))?16u:12u;
++ uint64_t aperture=1ull<<(shift+1+((id1>>28)&7u));
++ if(w->log)w->log(w->ctx,"eqwl: SMMU geometry ID1=%#x ID2=%#x contexts=%u stage2=%u page_shift=%u aperture=%#llx\n",
++     id1,id2,count,stage2,shift,(unsigned long long)aperture);
++ /* SDM845 donor geometry only. Refuse unfamiliar layouts before context reads. */
++ if(id1==UINT32_MAX || !count || count>64 || stage2>count || shift!=12 ||
++    aperture!=0x80000 || !groups || groups>128)return;
++ bool used[64]={false};
++ for(unsigned i=0;i<groups;i++){
++  uint32_t smr=rd(w->wlan_smmu+0x800+4*i);
++  uint32_t s2cr=rd(w->wlan_smmu+0xc00+4*i);
++  if((smr&(1u<<31)) && ((s2cr>>16)&3)==0 && (s2cr&0xffu)<count)
++   used[s2cr&0xffu]=true;
++ }
++ vm_offset_t gr1=ml_io_map(0x15001000ul,0x1000);
++ vm_offset_t contexts=ml_io_map(0x15040000ul,0x1000ul*count);
++ if(!gr1 || !contexts)return;
++ int candidate=-1;
++ for(unsigned i=0;i<count;i++){
++  vm_offset_t cb=contexts+0x1000ul*i;
++  uint32_t ctl=rd(cb),cbar=rd(gr1+4*i),cba2r=rd(gr1+0x800+4*i);
++  uint32_t fsr=rd(cb+0x58);
++  if(w->log)w->log(w->ctx,"eqwl: SMMU context=%u used=%u SCTLR=%#x CBAR=%#x CBA2R=%#x FSR=%#x\n",
++      i,used[i]?1u:0u,ctl,cbar,cba2r,fsr);
++  if(i>=stage2 && !used[i] && ctl==0 && fsr==0 && cbar!=UINT32_MAX && cba2r!=UINT32_MAX)
++   candidate=(int)i;
++ }
++ if(w->log)w->log(w->ctx,"eqwl: SMMU context candidate=%d (observed only)\n",candidate);
++}
+ /* Check both WLAN streams and optionally install a single legacy SMR. */
+ static bool eq_wlfw_smmu_bypass(struct eq_wlfw_probe *w)
+ {
+@@ -208,6 +242,7 @@
+    __asm__ volatile("dsb sy" ::: "memory");
+    if(w->log)w->log(w->ctx,"eqwl: SMMU restore SMR=%#x S2CR=%#x expected_S2CR=%#x\n",
+      rd(smr_addr),rd(s2cr_addr),old_s2cr);
++   eq_wlfw_context_survey(w);
+    return false;
+   }
+  }
