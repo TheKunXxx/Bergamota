@@ -50,7 +50,7 @@ jobs:
   build:
     # macos-14 retires 2026-11-02. Pin Xcode 16.4 on macos-15;
     # patch 0143 supplies kernelContent for its iig-generated RPC code.
-    runs-on: ${{ github.ref == 'refs/heads/port/equuleus' && 'macos-15-intel' || 'macos-15' }}
+    runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
