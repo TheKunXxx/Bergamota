@@ -9,12 +9,12 @@
 + unsigned groups=rd(w->wlan_smmu+0x20)&0xffu;
 + unsigned count=id1&0xffu,stage2=(id1>>16)&0xffu;
 + unsigned shift=(id1&(1u<<31))?16u:12u;
-+ uint64_t aperture=1ull<<(shift+1+((id1>>28)&7u));
-+ if(w->log)w->log(w->ctx,"eqwl: SMMU geometry ID1=%#x ID2=%#x contexts=%u stage2=%u page_shift=%u aperture=%#llx\n",
-+     id1,id2,count,stage2,shift,(unsigned long long)aperture);
-+ /* SDM845 donor geometry only. Refuse unfamiliar layouts before context reads. */
++ uint64_t cb_offset=1ull<<(shift+1+((id1>>28)&7u));
++ if(w->log)w->log(w->ctx,"eqwl: SMMU geometry ID1=%#x ID2=%#x contexts=%u stage2=%u page_shift=%u cb_offset=%#llx\n",
++     id1,id2,count,stage2,shift,(unsigned long long)cb_offset);
++ /* ID1 gives the context-bank offset; the complete window is twice that. */
 + if(id1==UINT32_MAX || !count || count>64 || stage2>count || shift!=12 ||
-+    aperture!=0x80000 || !groups || groups>128)return;
++    cb_offset!=0x40000 || 0x1000ull*count>cb_offset || !groups || groups>128)return;
 + bool used[64]={false};
 + for(unsigned i=0;i<groups;i++){
 +  uint32_t smr=rd(w->wlan_smmu+0x800+4*i);
@@ -23,7 +23,7 @@
 +   used[s2cr&0xffu]=true;
 + }
 + vm_offset_t gr1=ml_io_map(0x15001000ul,0x1000);
-+ vm_offset_t contexts=ml_io_map(0x15040000ul,0x1000ul*count);
++ vm_offset_t contexts=ml_io_map(0x15000000ul+(vm_offset_t)cb_offset,0x1000ul*count);
 + if(!gr1 || !contexts)return;
 + int candidate=-1;
 + for(unsigned i=0;i<count;i++){
