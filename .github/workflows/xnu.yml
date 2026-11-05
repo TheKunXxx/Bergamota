@@ -57,6 +57,7 @@ jobs:
 
       - name: Check equuleus WLFW registration and transport
         run: |
+          python3 tools/tests/test-equuleus-smmu-0175.py
           python3 tools/tests/test-equuleus-wlfw-register.py
           EQUULEUS_TEST_0164=1 python3 tools/tests/test-equuleus-glink.py
 
@@ -222,3 +223,4 @@ jobs:
           name: xnu-kernel
           path: out/
           if-no-files-found: warn
+

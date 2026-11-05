@@ -1,0 +1,219 @@
+--- a/bsd/dev/equuleus_wlfw_probe.h
++++ b/bsd/dev/equuleus_wlfw_probe.h
+@@ -1,7 +1,7 @@
+ /* SPDX-License-Identifier: APSL-2.0
+  * 0164: register WLFW indications before probing capabilities.
+  * Registration fields/status bits follow pinned dipper-xnu's mi8_wlfw.c/v01.
+- * This diagnostic does not assign MSA memory, download BDF, or enable WLAN.
++ * Optional MSA assignment and SMMU/power stages are explicitly boot-gated.
+  */
+ #ifndef EQUULEUS_WLFW_PROBE_H
+ #define EQUULEUS_WLFW_PROBE_H
+@@ -161,6 +161,7 @@
+  int r=ops->lookup(w->p,EQ_WLFW_SERVICE,1,0);
+  if(r){ops->close(w->p);w->p=NULL;return false;}return true;
+ }
++#include "equuleus_wlfw_smmu.h"
+ static void eq_wlfw_context_survey(struct eq_wlfw_probe *w)
+ {
+  uint32_t id1=rd(w->wlan_smmu+0x24),id2=rd(w->wlan_smmu+0x28);
+@@ -253,6 +254,9 @@
+ {
+  if(!w->wlan_smmu)w->wlan_smmu=ml_io_map(0x15000000ul,0x1000);
+  if(!w->wlan_smmu)return false;
++ unsigned translate=0;
++ if(PE_parse_boot_argn("eqwlan_translate",&translate,sizeof(translate)) && translate==1)
++  return eq_wlfw_smmu_translate(w);
+  uint32_t cr0=rd(w->wlan_smmu),id0=rd(w->wlan_smmu+0x20);
+  unsigned count=id0&0xffu;
+  if(w->log)w->log(w->ctx,"eqwl: SMMU CR0=%#x ID0=%#x groups=%u\n",cr0,id0,count);
+@@ -339,6 +343,8 @@
+ }
+ static void eq_wlfw_poll(struct eq_wlfw_probe *w,uint64_t now,bool wlan_up)
+ {
++ static uint64_t smmu_watch_at;
++ if(eqs_active && now>=smmu_watch_at){eqs_watch(w);smmu_watch_at=now+1000000ull;}
+  if(!w->p || !w->present || !wlan_up)return;
+  if(w->answered){
+   if(w->power_probe && !w->power_attempted && w->msa_ready_ack &&
+@@ -346,7 +352,7 @@
+    w->power_attempted=true;
+    bool route=eq_wlfw_smmu_bypass(w);
+    bool powered=route && eq_wlfw_power(w);
+-   if(w->log)w->log(w->ctx,"eqwl: power SMMU_bypass=%u rails_ok=%u FW_READY=%u\n",
++   if(w->log)w->log(w->ctx,"eqwl: power SMMU_route=%u rails_ok=%u FW_READY=%u\n",
+        route?1u:0u,powered?1u:0u,w->fw_ready?1u:0u);
+   }
+   return;
+@@ -400,6 +406,9 @@
+ }
+ static void eq_wlfw_stop(struct eq_wlfw_probe *w)
+ {
++ if(eqs_active && w->log)
++  w->log(w->ctx,"eqwl: translate final SCTLR=%#x FSR=%#x FAR=%#x:%#x FSYNR0=%#x\n",
++    rd(eqs_cb),rd(eqs_cb+0x58),rd(eqs_cb+0x64),rd(eqs_cb+0x60),rd(eqs_cb+0x68));
+  if(w->wlan_smmu && w->log)
+   w->log(w->ctx,"eqwl: SMMU final GFSR=%#x GFSYNR1=%#x\n",
+     rd(w->wlan_smmu+0x48),rd(w->wlan_smmu+0x54));
+--- /dev/null
++++ b/bsd/dev/equuleus_wlfw_smmu.h
+@@ -0,0 +1,159 @@
++/* 0175: opt-in SMMUv2 stage-1 translation for equuleus WLAN.
++ * Register/layout reference: Linux v6.12 arm-smmu.h and pinned dipper-xnu.
++ * Only the reserved MSA window is mapped. Tables live until full reboot.
++ */
++#include <vm/vm_kern.h>
++extern uint64_t kvtophys(vm_offset_t);
++static vm_offset_t eqs_tables,eqs_cb;
++static bool eqs_attempted,eqs_active;
++static uint32_t eqs_last_fault;
++static void eqs_barrier(void){__asm__ volatile("dsb sy" ::: "memory");}
++static bool eqs_tlb(vm_offset_t cb)
++{
++ wr(cb+0x610,3); /* ASID 3 is private to the previously unused CB3. */
++ wr(cb+0x7f0,0);
++ eqs_barrier();
++ for(unsigned i=0;i<1000;i++){
++  if(!(rd(cb+0x7f4)&1))return true;
++  delay_for_interval(10,NSEC_PER_USEC);
++ }
++ return false;
++}
++/* Reject another owner, including overlapping masked WLAN stream entries. */
++static bool eqs_available(struct eq_wlfw_probe *w,unsigned groups,unsigned slot,uint32_t old)
++{
++ if(rd(w->wlan_smmu+0x800+4*slot)!=0 ||
++    rd(w->wlan_smmu+0xc00+4*slot)!=old)return false;
++ for(unsigned i=0;i<groups;i++){
++  uint32_t smr=rd(w->wlan_smmu+0x800+4*i),s2cr=rd(w->wlan_smmu+0xc00+4*i);
++  if(!(smr&0x80000000u))continue;
++  if(((s2cr>>16)&3)==0 && (s2cr&0xff)==3)return false;
++  unsigned mask=(smr>>16)&0x7fff,id=smr&0x7fff;
++  if(!((id^0x40u)&~mask) || !((id^0x41u)&~mask))return false;
++ }
++ return true;
++}
++static void eqs_watch(struct eq_wlfw_probe *w)
++{
++ if(!eqs_active)return;
++ uint32_t global=rd(w->wlan_smmu+0x48),fault=rd(eqs_cb+0x58)&0xc00001feu;
++ uint32_t combined=global|fault;
++ if(combined!=eqs_last_fault){
++  eqs_last_fault=combined;
++  if(w->log)w->log(w->ctx,"eqwl: translate fault GFSR=%#x FSR=%#x FAR=%#x:%#x FSYNR0=%#x SID=%#x\n",
++   global,rd(eqs_cb+0x58),rd(eqs_cb+0x64),rd(eqs_cb+0x60),rd(eqs_cb+0x68),rd(w->wlan_smmu+0x54));
++ }
++}
++static bool eq_wlfw_smmu_translate(struct eq_wlfw_probe *w)
++{
++ if(eqs_attempted)return eqs_active;
++ eqs_attempted=true;
++ vm_offset_t base=w->wlan_smmu;
++ unsigned groups=rd(base+0x20)&0xff;
++ uint32_t cr0=rd(base),id0=rd(base+0x20),id1=rd(base+0x24),id2=rd(base+0x28);
++ if(w->log)w->log(w->ctx,"eqwl: translate preflight CR0=%#x ID0=%#x ID1=%#x ID2=%#x MSA=%u/%u/%u\n",
++  cr0,id0,id1,id2,w->msa_assigned?1u:0u,w->msa_ready_ack?1u:0u,w->msa_layout_ok?1u:0u);
++ if(!w->msa_assigned || !w->msa_ready_ack || !w->msa_layout_ok ||
++    (cr0&9u) || !(id0&(1u<<30)) || !(id0&(1u<<27)) ||
++    !groups || groups>128 || id1!=0x5000002du || !(id2&(1u<<12)) ||
++    ((id2>>4)&15)<2 || rd(base+0x48))return false;
++ vm_offset_t cb=ml_io_map(0x15043000ul,0x1000);
++ vm_offset_t gr1=ml_io_map(0x15001000ul,0x1000);
++ if(!cb || !gr1)return false;
++ if(w->log)w->log(w->ctx,"eqwl: translate CB3 snapshot SCTLR=%#x FSR=%#x CBAR=%#x CBA2R=%#x\n",
++  rd(cb),rd(cb+0x58),rd(gr1+12),rd(gr1+0x80c));
++ if(rd(cb)!=0xe0 || rd(cb+0x58)!=0x400 ||
++    rd(gr1+12)!=0x10000 || rd(gr1+0x80c)!=1)return false;
++ unsigned slot=groups;uint32_t old_s2cr=0;
++ for(unsigned i=0;i<groups;i++){
++  uint32_t smr=rd(base+0x800+4*i),s2cr=rd(base+0xc00+4*i);
++  if(!smr && (s2cr==0 || s2cr==0x20000)){slot=i;old_s2cr=s2cr;break;}
++ }
++ if(slot==groups || !eqs_available(w,groups,slot,old_s2cr))return false;
++ /* 16 KiB allocation accommodates XNU's page size; each SMMU table is 4 KiB.
++  * Allocation is retained even on failure, avoiding any stale table walk reuse. */
++ if(kmem_alloc(kernel_map,&eqs_tables,0x4000,KMA_KOBJECT|KMA_ZERO|KMA_DATA,
++               VM_KERN_MEMORY_IOKIT)!=KERN_SUCCESS)return false;
++ uint64_t phys[3];
++ for(unsigned i=0;i<3;i++){
++  phys[i]=kvtophys(eqs_tables+0x1000ul*i);
++  if(!phys[i] || (phys[i]&0xfff) || phys[i]>=(1ull<<40) ||
++     kvtophys(eqs_tables+0x1000ul*i+0xfff)!=phys[i]+0xfff)return false;
++  for(unsigned j=0;j<i;j++)if(phys[i]==phys[j])return false;
++ }
++ uint64_t *l1=(uint64_t *)eqs_tables,*l2=(uint64_t *)(eqs_tables+0x1000),
++          *l3=(uint64_t *)(eqs_tables+0x2000);
++ /* Fixed 1 MiB MSA stays inside a single 2 MiB L3 span. */
++ if((EQ_WLFW_MSA_BASE>>21)!=((EQ_WLFW_MSA_BASE+EQ_WLFW_MSA_BYTES-1)>>21))
++  return false;
++ l1[(EQ_WLFW_MSA_BASE>>30)&511]=phys[1]|3;
++ l2[(EQ_WLFW_MSA_BASE>>21)&511]=phys[2]|3;
++ for(uint64_t pa=EQ_WLFW_MSA_BASE;pa<EQ_WLFW_MSA_BASE+EQ_WLFW_MSA_BYTES;pa+=0x1000)
++  l3[(pa>>12)&511]=pa|0xe43ull|(3ull<<53); /* NC, RW, AF, nG, XN */
++ for(vm_offset_t va=eqs_tables;va<eqs_tables+0x4000;va+=64)
++  __asm__ volatile("dc civac, %0" :: "r"(va) : "memory");
++ eqs_barrier();
++ const unsigned off[]={0x10,0x20,0x24,0x28,0x2c,0x30,0x38,0x3c};
++ uint32_t saved[8];
++ for(unsigned i=0;i<8;i++)saved[i]=rd(cb+off[i]);
++ uint64_t ttbr=phys[0]|(3ull<<48);
++ uint32_t values[]={0,(uint32_t)ttbr,(uint32_t)(ttbr>>32),0,0,0x803519,0x44,0};
++ /* Preserve implementation-defined TCR2 bits; compare architected fields. */
++ values[0]=(saved[0]&~0x3801fu)|0x38012u; /* 40-bit PA, 16-bit ASID */
++ if(!eqs_available(w,groups,slot,old_s2cr) || rd(cb)!=0xe0)return false;
++ bool ok=true,published=false;
++ for(unsigned i=0;i<8;i++){
++  wr(cb+off[i],values[i]);eqs_barrier();
++  uint32_t mask=i==0?0x3801fu:UINT32_MAX;
++  if((rd(cb+off[i])&mask)!=(values[i]&mask)){
++   if(w->log)w->log(w->ctx,"eqwl: translate readback failed offset=%#x expected=%#x actual=%#x mask=%#x\n",
++    off[i],values[i],rd(cb+off[i]),mask);
++   ok=false;break;
++  }
++ }
++ if(ok){
++  ok=eqs_tlb(cb);
++  if(!ok && w->log)w->log(w->ctx,"eqwl: translate TLB timeout\n");
++ }
++ if(ok){
++  wr(cb,0x1127);eqs_barrier(); /* M,TRE,AFE,CFRE,HUPCF,S1_ASIDPNE */
++  ok=rd(cb)==0x1127 && !(rd(cb+0x58)&0xc00001feu) && !rd(base+0x48);
++ }
++ if(ok)ok=eqs_available(w,groups,slot,old_s2cr);
++ if(ok){
++  wr(base+0xc00+4*slot,3);eqs_barrier();
++  ok=rd(base+0xc00+4*slot)==3;
++ }
++ if(ok){
++  wr(base+0x800+4*slot,0x80010040);eqs_barrier();published=true;
++  ok=rd(base+0x800+4*slot)==0x80010040 && rd(base+0xc00+4*slot)==3 &&
++     !(rd(cb+0x58)&0xc00001feu) && !rd(base+0x48);
++ }
++ if(w->log)w->log(w->ctx,"eqwl: translate CB3 slot=%u root=%#llx MSA=%#llx+%#x SCTLR=%#x TCR=%#x TCR2=%#x SMR=%#x S2CR=%#x ready=%u\n",
++  slot,(unsigned long long)phys[0],(unsigned long long)EQ_WLFW_MSA_BASE,
++  EQ_WLFW_MSA_BYTES,rd(cb),rd(cb+0x30),rd(cb+0x10),rd(base+0x800+4*slot),
++  rd(base+0xc00+4*slot),ok?1u:0u);
++ if(!ok){
++  /* No rail votes have occurred. Unpublish before disabling or restoring CB. */
++  if(published){wr(base+0x800+4*slot,0);eqs_barrier();}
++  bool detached=rd(base+0x800+4*slot)==0;
++  bool restored=false;
++  if(detached){
++   wr(base+0xc00+4*slot,old_s2cr);eqs_barrier();
++   wr(cb,0xe0);eqs_barrier();
++   if(rd(cb)==0xe0){
++    bool synced=eqs_tlb(cb);
++    for(unsigned i=0;i<8;i++)wr(cb+off[i],saved[i]);
++    eqs_barrier();
++    restored=synced && rd(base+0xc00+4*slot)==old_s2cr;
++    for(unsigned i=0;i<8;i++)if(rd(cb+off[i])!=saved[i])restored=false;
++   }
++  }
++  if(w->log)w->log(w->ctx,"eqwl: translate rollback detached=%u restored=%u; tables retained\n",
++   detached?1u:0u,restored?1u:0u);
++  return false;
++ }
++ eqs_cb=cb;eqs_active=true;
++ if(w->log)w->log(w->ctx,"eqwl: translate active; MSA-only tables retained until reboot\n");
++ return true;
++}
