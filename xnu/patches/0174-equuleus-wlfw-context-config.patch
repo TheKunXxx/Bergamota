@@ -1,0 +1,40 @@
+--- a/bsd/dev/equuleus_wlfw_probe.h
++++ b/bsd/dev/equuleus_wlfw_probe.h
+@@ -51,3 +51,37 @@
+        before,after,restored,after==(before|4u)?1u:0u,restored==before?1u:0u);
++   unsigned config_probe=0;
++   if(after==(before|4u) && restored==before &&
++      PE_parse_boot_argn("eqwlan_cbconfig",&config_probe,sizeof(config_probe)) && config_probe==1){
++    /* SCTLR.M stays zero; restore each register before the next. */
++    const unsigned offsets[]={0x20,0x24,0x30,0x10,0x38,0x3c};
++    const uint32_t bits[]={0x1000u,0x10000u,0x800000u,0x10u,1u,1u};
++    uint32_t writable_mask=0,restored_mask=0;
++    for(unsigned j=0;j<6;j++){
++     bool attached=false;
++     for(unsigned k=0;k<groups;k++){
++      uint32_t smr=rd(w->wlan_smmu+0x800+4*k);
++      uint32_t s2cr=rd(w->wlan_smmu+0xc00+4*k);
++      if((smr&(1u<<31)) && ((s2cr>>16)&3)==0 && (s2cr&0xffu)==3)
++       attached=true;
++     }
++     if(attached || rd(cb)!=before || rd(cb+0x58)!=fsr_before ||
++        rd(gr1+12)!=0x10000u || rd(gr1+0x80c)!=1)break;
++     vm_offset_t reg=cb+offsets[j];
++     uint32_t original=rd(reg),trial=original^bits[j];
++     wr(reg,trial);
++     __asm__ volatile("dsb sy" ::: "memory");
++     uint32_t observed=rd(reg);
++     wr(reg,original);
++     __asm__ volatile("dsb sy" ::: "memory");
++     uint32_t recovered=rd(reg);
++     if(observed==trial)writable_mask|=1u<<j;
++     if(recovered==original)restored_mask|=1u<<j;
++     if(w->log)w->log(w->ctx,"eqwl: CB3 config offset=%#x before=%#x trial=%#x after=%#x restored=%#x\n",
++         offsets[j],original,trial,observed,recovered);
++     if(recovered!=original)break;
++    }
++    if(w->log)w->log(w->ctx,"eqwl: CB3 config writable_mask=%#x restored_mask=%#x SCTLR=%#x FSR=%#x GFSR=%#x\n",
++        writable_mask,restored_mask,rd(cb),rd(cb+0x58),rd(w->wlan_smmu+0x48));
++   }
+   }else if(w->log)w->log(w->ctx,"eqwl: CB3 access refused: snapshot changed\n");
+  }
