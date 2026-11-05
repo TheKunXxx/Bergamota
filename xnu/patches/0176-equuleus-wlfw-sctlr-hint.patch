@@ -1,0 +1,29 @@
+--- a/bsd/dev/equuleus_wlfw_smmu.h
++++ b/bsd/dev/equuleus_wlfw_smmu.h
+@@ -93,11 +93,11 @@
+  for(vm_offset_t va=eqs_tables;va<eqs_tables+0x4000;va+=64)
+   __asm__ volatile("dc civac, %0" :: "r"(va) : "memory");
+  eqs_barrier();
+- const unsigned off[]={0x10,0x20,0x24,0x28,0x2c,0x30,0x38,0x3c};
++ const unsigned off[]={0x10,0x30,0x20,0x24,0x28,0x2c,0x38,0x3c};
+  uint32_t saved[8];
+  for(unsigned i=0;i<8;i++)saved[i]=rd(cb+off[i]);
+  uint64_t ttbr=phys[0]|(3ull<<48);
+- uint32_t values[]={0,(uint32_t)ttbr,(uint32_t)(ttbr>>32),0,0,0x803519,0x44,0};
++ uint32_t values[]={0,0x803519,(uint32_t)ttbr,(uint32_t)(ttbr>>32),0,0,0x44,0};
+  /* Preserve implementation-defined TCR2 bits; compare architected fields. */
+  values[0]=(saved[0]&~0x3801fu)|0x38012u; /* 40-bit PA, 16-bit ASID */
+  if(!eqs_available(w,groups,slot,old_s2cr) || rd(cb)!=0xe0)return false;
+@@ -116,8 +116,10 @@
+   if(!ok && w->log)w->log(w->ctx,"eqwl: translate TLB timeout\n");
+  }
+  if(ok){
+-  wr(cb,0x1127);eqs_barrier(); /* M,TRE,AFE,CFRE,HUPCF,S1_ASIDPNE */
+-  ok=rd(cb)==0x1127 && !(rd(cb+0x58)&0xc00001feu) && !rd(base+0x48);
++  /* ASIDPNE (bit 12) is an optional hint, ignored on this hardware.
++   * Keep exact verification of the functional bits; do not request the hint. */
++  wr(cb,0x127);eqs_barrier(); /* M,TRE,AFE,CFRE,HUPCF */
++  ok=rd(cb)==0x127 && !(rd(cb+0x58)&0xc00001feu) && !rd(base+0x48);
+  }
+  if(ok)ok=eqs_available(w,groups,slot,old_s2cr);
+  if(ok){

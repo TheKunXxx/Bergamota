@@ -11,6 +11,7 @@ with tempfile.TemporaryDirectory() as temp:
     root = Path(temp)
     subprocess.run(['git', 'apply', '--include=bsd/dev/equuleus_wlfw_smmu.h',
                     str(patch)], cwd=root, check=True)
+    subprocess.run(['git', 'apply', str(repo / 'xnu/patches/0176-equuleus-wlfw-sctlr-hint.patch')], cwd=root, check=True)
     source = (root / 'bsd/dev/equuleus_wlfw_smmu.h').read_text()
     source = source.replace('#include <vm/vm_kern.h>', '')
     source = source.replace('__asm__ volatile("dsb sy" ::: "memory");', '')

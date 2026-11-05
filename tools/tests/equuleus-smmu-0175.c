@@ -19,15 +19,17 @@ struct eq_wlfw_probe {
 #define KERN_SUCCESS 0
 static int kernel_map;
 static uint32_t regs[0x80000/4];
-static unsigned writes,failreg,allocation_fails,badpa,tlb_busy,fail_publish,fail_detach,fail_s2cr;
+static unsigned writes,failreg,allocation_fails,badpa,tlb_busy,fail_publish,fail_detach,fail_s2cr,sctlr_drop;
 static unsigned char pool[0x4000] __attribute__((aligned(0x4000)));
 static unsigned at(vm_offset_t p){assert(p>=0x15000000ul && p<0x15080000ul);assert(!(p&3));return (p-0x15000000ul)/4;}
 static uint32_t rd(vm_offset_t p){return regs[at(p)];}
 static void wr(vm_offset_t p,uint32_t v){
  writes++;
+ if(p==0x15043024ul && v==0x30001)assert(rd(0x15043030)==0x803519);
  if(fail_s2cr && p==0x15000c18ul && v==3)return;
  if(failreg && p==0x15043000ul+failreg)return;
  if(p==0x15000800ul+6*4 && ((v && fail_publish) || (!v && fail_detach)))return;
+ if(p==0x15043000ul && v!=0xe0)v&=~(0x1000u|sctlr_drop);
  regs[at(p)]=v;
  if(p==0x150437f0)regs[at(0x150437f4)]=tlb_busy;
 }
@@ -44,7 +46,7 @@ uint64_t kvtophys(vm_offset_t va){
 }
 #include "smmu175host.h"
 static void reset(void){
- memset(regs,0,sizeof(regs));writes=failreg=allocation_fails=badpa=tlb_busy=fail_publish=fail_detach=fail_s2cr=0;
+ memset(regs,0,sizeof(regs));writes=failreg=allocation_fails=badpa=tlb_busy=fail_publish=fail_detach=fail_s2cr=sctlr_drop=0;
  eqs_attempted=eqs_active=false;eqs_last_fault=0;
  regs[at(0x15000000)]=0x250406;
  regs[at(0x15000020)]=0x4c017e4c;
@@ -63,7 +65,7 @@ int main(void){
  struct eq_wlfw_probe w={.wlan_smmu=0x15000000,.msa_assigned=true,.msa_ready_ack=true,.msa_layout_ok=true};
  reset();assert(eq_wlfw_smmu_translate(&w));assert(eqs_active);
  assert(rd(0x15000818)==0x80010040 && rd(0x15000c18)==3);
- assert(rd(0x15043000)==0x1127);
+ assert(rd(0x15043000)==0x127);
  for(uint64_t pa=EQ_WLFW_MSA_BASE;pa<EQ_WLFW_MSA_BASE+EQ_WLFW_MSA_BYTES;pa+=4096){assert(mapped(pa));assert((((uint64_t*)(pool+0x2000))[(pa>>12)&511]&0x0000fffffffff000ull)==pa);}
  assert(!mapped(EQ_WLFW_MSA_BASE-4096));assert(!mapped(EQ_WLFW_MSA_BASE+EQ_WLFW_MSA_BYTES));
  unsigned entries=0;for(unsigned i=0;i<512;i++){uint64_t p=((uint64_t*)(pool+0x2000))[i];if(p){entries++;assert((p&(3ull<<53))==(3ull<<53));}}
@@ -74,10 +76,11 @@ int main(void){
  reset();regs[at(0x15000c00)]=3;assert(!eq_wlfw_smmu_translate(&w) && !writes);
  reset();allocation_fails=1;assert(!eq_wlfw_smmu_translate(&w) && !writes);
  reset();badpa=1;assert(!eq_wlfw_smmu_translate(&w) && !writes);
+ reset();sctlr_drop=1;assert(!eq_wlfw_smmu_translate(&w));assert(rd(0x15043000)==0xe0 && !rd(0x15000818));
  reset();failreg=0x30;assert(!eq_wlfw_smmu_translate(&w));assert(rd(0x15043000)==0xe0 && !rd(0x15000818) && !rd(0x15000c18));
  reset();tlb_busy=1;assert(!eq_wlfw_smmu_translate(&w));assert(rd(0x15043000)==0xe0 && !rd(0x15000818));
  reset();fail_s2cr=1;assert(!eq_wlfw_smmu_translate(&w));assert(rd(0x15043000)==0xe0 && !rd(0x15000818));
  reset();fail_publish=1;assert(!eq_wlfw_smmu_translate(&w));assert(rd(0x15043000)==0xe0 && !rd(0x15000c18));
  assert(rd(0x15043010)==0x40018077 && !rd(0x15043020));
- puts("0175 table bounds, readback, collision, allocation, TLB timeout and rollback: PASS");
+ puts("0175/0176 table bounds, readback, collision, allocation, TLB timeout and rollback: PASS");
 }
