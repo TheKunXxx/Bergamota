@@ -1,0 +1,32 @@
+--- a/bsd/dev/equuleus_wlfw_probe.h
++++ b/bsd/dev/equuleus_wlfw_probe.h
+@@ -29,9 +29,28 @@
+   uint32_t fsr=rd(cb+0x58);
+   if(w->log)w->log(w->ctx,"eqwl: SMMU context=%u used=%u SCTLR=%#x CBAR=%#x CBA2R=%#x FSR=%#x\n",
+       i,used[i]?1u:0u,ctl,cbar,cba2r,fsr);
+-  if(i>=stage2 && !used[i] && ctl==0 && fsr==0 && cbar!=UINT32_MAX && cba2r!=UINT32_MAX)
++  if(i>=stage2 && !used[i] && !(ctl&~0xe0u) && !(fsr&0xc00001feu) && cbar==0x10000u && cba2r==1)
+    candidate=(int)i;
+  }
++ unsigned probe=0;
++ if(candidate==3 && !used[3] &&
++    PE_parse_boot_argn("eqwlan_cbprobe",&probe,sizeof(probe)) && probe==1){
++  vm_offset_t cb=contexts+0x3000ul;
++  uint32_t before=rd(cb),fsr_before=rd(cb+0x58);
++  bool stable=before==0xe0u && fsr_before==0x400u &&
++      rd(gr1+12)==0x10000u && rd(gr1+0x80c)==1;
++  /* AFE bit only, with translation M kept clear and no stream attached. */
++  if(stable){
++   wr(cb,before|4u);
++   __asm__ volatile("dsb sy" ::: "memory");
++   uint32_t after=rd(cb);
++   wr(cb,before);
++   __asm__ volatile("dsb sy" ::: "memory");
++   uint32_t restored=rd(cb);
++   if(w->log)w->log(w->ctx,"eqwl: CB3 access before=%#x after=%#x restored=%#x writable=%u restored_ok=%u\n",
++       before,after,restored,after==(before|4u)?1u:0u,restored==before?1u:0u);
++  }else if(w->log)w->log(w->ctx,"eqwl: CB3 access refused: snapshot changed\n");
++ }
+  if(w->log)w->log(w->ctx,"eqwl: SMMU context candidate=%d (observed only)\n",candidate);
+ }
+ /* Check both WLAN streams and optionally install a single legacy SMR. */
