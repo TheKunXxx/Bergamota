@@ -1,0 +1,32 @@
+--- a/bsd/dev/equuleus_wlfw_probe.h
++++ b/bsd/dev/equuleus_wlfw_probe.h
+@@ -36,19 +36,28 @@
+   vm_offset_t smr_addr=w->wlan_smmu+0x800+4*slot;
+   vm_offset_t s2cr_addr=w->wlan_smmu+0xc00+4*slot;
+   if(rd(smr_addr)!=0 || rd(s2cr_addr)!=old_s2cr)return false;
++  if(w->log)w->log(w->ctx,"eqwl: SMMU before slot=%u SMR=%#x S2CR=%#x GFSR=%#x\n",
++    slot,rd(smr_addr),rd(s2cr_addr),rd(w->wlan_smmu+0x48));
+   /* Program bypass while the match is invalid, then publish only SID 0x40/41. */
+   wr(s2cr_addr,1u<<16);
+   __asm__ volatile("dsb sy" ::: "memory");
+-  if(rd(s2cr_addr)==(1u<<16)){
++  uint32_t s2cr_after=rd(s2cr_addr);
++  if(w->log)w->log(w->ctx,"eqwl: SMMU after S2CR write expected=%#x actual=%#x\n",1u<<16,s2cr_after);
++  if(s2cr_after==(1u<<16)){
+    wr(smr_addr,0x80010040u);
+    __asm__ volatile("dsb sy" ::: "memory");
+   }
++  if(w->log)w->log(w->ctx,"eqwl: SMMU after route SMR=%#x S2CR=%#x GFSR=%#x\n",
++    rd(smr_addr),rd(s2cr_addr),rd(w->wlan_smmu+0x48));
+   bool installed=rd(smr_addr)==0x80010040u && rd(s2cr_addr)==(1u<<16);
+   if(w->log)w->log(w->ctx,"eqwl: SMMU route slot=%u readback=%u\n",slot,installed?1u:0u);
+   if(!installed){
+    wr(smr_addr,0);
+    __asm__ volatile("dsb sy" ::: "memory");
+    if(rd(smr_addr)==0)wr(s2cr_addr,old_s2cr);
++   __asm__ volatile("dsb sy" ::: "memory");
++   if(w->log)w->log(w->ctx,"eqwl: SMMU restore SMR=%#x S2CR=%#x expected_S2CR=%#x\n",
++     rd(smr_addr),rd(s2cr_addr),old_s2cr);
+    return false;
+   }
+  }
